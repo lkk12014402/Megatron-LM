@@ -1,5 +1,7 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
+from typing import Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add, get_bias_dropout_norm_add
 from megatron.core.fusions.fused_dot_product_attention import FusedDotProductAttention
@@ -12,23 +14,25 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.rmsnorm import RMSNorm
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import is_real_cuda_device_available
 
 try:
-    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
+    from megatron.core.extensions.intel_transformer_engine import (
         IntelTEColumnParallelLinear,
         IntelTEDotProductAttention,
+        IntelTEDotProductAttentionFp8Disabled,
         IntelTENorm,
         IntelTERowParallelLinear,
+        IntelTERowParallelLinearFp8Disabled,
     )
 except:
     pass
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEColumnParallelGroupedLinear,
+        TEColumnParallelLinear,
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TENorm,
@@ -41,7 +45,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -52,33 +56,50 @@ except ImportError:
 
     from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
+    warnings.warn('Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
 
-# Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_gpt_layer_with_transformer_engine_spec(
-    num_experts: int = None,
-    moe_grouped_gemm: bool = False,
-    qk_layernorm: bool = False,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    qk_layernorm: Optional[bool] = False,
+    fp8: Optional[str] = None,
     enable_fsdpa: bool = False,
     fp8_coverage: dict = {},
+    context_parallel_size: int = 1,
 ) -> ModuleSpec:
+    """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
+
+
+    Args:
+        num_experts (int, optional): Number of experts. Defaults to None.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        fp8 (str, optional): Flag to decide the linear layer spec for MoE. Defaults to None.
+
+    Returns:
+        ModuleSpec: Module specification with TE modules
+    """
     mlp = _get_mlp_module_spec(
         use_te=True,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
+        fp8=fp8,
         fp8_coverage=fp8_coverage,
     )
 
     use_intel_te = not is_real_cuda_device_available()
     if use_intel_te:
-        try:
-            from intel_transformer_engine.utils import is_gaudi3
-        except:
-            from habana_transformer_engine.utils import is_gaudi3
-        if is_gaudi3() and enable_fsdpa and fp8_coverage.get('attention', True):
-            core_attention_class = IntelTEDotProductAttention
+        from intel_transformer_engine.utils import is_gaudi3
+
+        cp_enabled = context_parallel_size > 1
+        if (is_gaudi3() or cp_enabled) and enable_fsdpa:
+            core_attention_class = (
+                IntelTEDotProductAttention
+                if fp8_coverage.get('attention', True)
+                else IntelTEDotProductAttentionFp8Disabled
+            )
         elif enable_fsdpa:
             core_attention_class = FusedDotProductAttention
         else:
@@ -116,15 +137,25 @@ def get_gpt_layer_with_transformer_engine_spec(
     )
 
 
-# Use this spec for an implementation using only modules in megatron core
 def get_gpt_layer_local_spec(
-    num_experts: int = None,
-    moe_grouped_gemm: bool = False,
-    qk_layernorm: bool = False,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    qk_layernorm: Optional[bool] = False,
     normalization_type: str = 'LayerNorm',
     enable_fsdpa: bool = False,
     use_pre_norm=True,
 ) -> ModuleSpec:
+    """Use this spec for an implementation using only modules in Megatron-Core.
+
+
+    Args:
+        num_experts (int, optional): Number of experts. Defaults to None.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+
+    Returns:
+        ModuleSpec: Module specification with Megatron-Core modules
+    """
     mlp = _get_mlp_module_spec(
         use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
@@ -170,13 +201,14 @@ def get_gpt_layer_local_spec(
     )
 
 
-# Helper function to get module spec for MLP/MoE
 def _get_mlp_module_spec(
-    use_te: bool = True,
-    num_experts: int = None,
-    moe_grouped_gemm: bool = False,
+    use_te: Optional[bool] = True,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    fp8: Optional[str] = None,
     fp8_coverage: dict = {},
 ) -> ModuleSpec:
+    """Helper function to get module spec for MLP/MoE"""
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         if use_te:
@@ -188,23 +220,37 @@ def _get_mlp_module_spec(
                 linear_fc2 = (
                     IntelTERowParallelLinear
                     if fp8_coverage.get('mlp_row_parallel', True)
-                    else RowParallelLinear
+                    else IntelTERowParallelLinearFp8Disabled
                 )
         else:
             linear_fc1 = ColumnParallelLinear
             linear_fc2 = RowParallelLinear
         return ModuleSpec(
-            module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=linear_fc1,
-                linear_fc2=linear_fc2,
-            ),
+            module=MLP, submodules=MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
         )
     else:
         # Mixture of experts with modules in megatron core.
-        if use_te and moe_grouped_gemm:
-            linear_fc1 = TEColumnParallelGroupedLinear
-            linear_fc2 = TERowParallelGroupedLinear
+        if use_te:
+            if is_real_cuda_device_available():
+                if moe_grouped_gemm:
+                    linear_fc1 = TEColumnParallelGroupedLinear
+                    linear_fc2 = TERowParallelGroupedLinear
+                elif fp8:
+                    linear_fc1 = TEColumnParallelLinear
+                    linear_fc2 = TERowParallelLinear
+                else:
+                    linear_fc1 = ColumnParallelLinear
+                    linear_fc2 = RowParallelLinear
+            else:
+                # TODO:
+                # linear_fc1 = IntelTEColumnParallelLinear
+                # linear_fc2 = (
+                #     IntelTERowParallelLinear
+                #     if fp8_coverage.get('mlp_row_parallel', True)
+                #     else IntelTERowParallelLinearFp8Disabled
+                # )
+                linear_fc1 = ColumnParallelLinear
+                linear_fc2 = RowParallelLinear
         else:
             linear_fc1 = ColumnParallelLinear
             linear_fc2 = RowParallelLinear

@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from typing import Optional, Tuple
 
@@ -48,14 +48,14 @@ def bias_dropout_add_unfused(training):
 
 @jit_fuser
 def bias_dropout_add_fused_train(
-    x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float,
+    x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float
 ) -> torch.Tensor:
     return _bias_dropout_add_func(x_with_bias, residual, prob, True)
 
 
 @jit_fuser
 def bias_dropout_add_fused_inference(
-    x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float,
+    x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float
 ) -> torch.Tensor:
     return _bias_dropout_add_func(x_with_bias, residual, prob, False)
 
@@ -76,9 +76,9 @@ def get_bias_dropout_add(training, fused):
 
 def _bias_dropout_norm_add_func(x_with_bias, residual, norm_op, prob, training):
     # type: (Tuple[Tensor, Optional[Tensor]], Tensor, torch.nn.Module, float, bool) -> Tensor
-    """ Performs out = residual + norm(dropout(x + bias))
+    """Performs out = residual + norm(dropout(x + bias))
 
-        This method is based on _bias_dropout_add_func. Some comments were removed to avoid duplication.
+    This method is based on _bias_dropout_add_func. Some comments were removed to avoid duplication.
     """
 
     x, bias = x_with_bias  # unpack

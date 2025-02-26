@@ -1,16 +1,19 @@
 # Megatron Core MoE Key Features
 
-### Parallelism
+Megatron-Core offers rich parallelism mappings, combining expert parallelism with tensor, data, sequence, and pipeline parallelism. This boosts Mixtral 8X7B bf16 training to achieve **438 TFLOPS** as of MCore v0.8.
 
-- **Expert Parallel**
+
+### Parallelism
+- **Expert Parallelism**
     - A specific method of parallelism for MoE models, where experts are partitioned onto different workers and each worker processes a different batch of training samples, each worker process one or more experts for each MoE layer.
-- **3D Parallel**: Data Parallel , Tensor Parallel, Pipeline Parallel, Sequence Parallel
-    - Note: When using MoE with expert parallelism and tensor parallelism, sequence parallelism must be used.
-- **Richer parallel mappings**: EP can be combined with DP/TP/PP/SP for handling larger MoE variants.
+- **3D Parallelism**: Data Parallelism, Tensor Parallelism, Pipeline Parallelism
+    - Note: When using MoE with expert parallelism and tensor parallelism, sequence parallelism must be enabled.
+- **Context Parallelism**:
+    - Split the sequence dimension to support long context training.
+- **Richer parallel mappings**: EP can be combined with DP/TP/PP/CP for handling larger MoE variants.
 - **Full distributed optimizer support.**
 
 ### Router and Load Balancing
-
 - Router type:
     - Top-K MLP router
 - Load Balancing algorithms:
@@ -18,7 +21,6 @@
     - Aux loss / Load balancing loss
 
 ### Performance Optimizations
-
 - GroupedGEMM when num local experts > 1
     - Supported dtype: bf16
     - Performance improvements for larger MoE models
@@ -28,24 +30,20 @@
 
 - Dropless / No token drop
 - Token drop and padding
-- Capacity bins
+- Capacity bins (no drop with optimized padding)
 
 ### Ease of use
-- Checkpoint converter (coming soon)
+- Checkpoint converter for Mixtral models, see the [example](https://github.com/HabanaAI/Megatron-LM/tree/main/examples/mixtral) for details.
+- Distributed checkpoining
 - Per-layer logging
+- Per-layer token-per-expert distribution tracking tool
 
 ## Upcoming features
-
-- Enhanced cutlass GroupedGEMM kernels
-    - Reduced host-device syncs.
-    - More supported dtype: fp32/bf16/fp16
-    - Kernel heuristics tuned for H100/A100/A10/L40S
-    - BWD cutlass GroupedGEMM kernels supported
 - Token permutation / unpermutation fusion
 - Fused Sinkhorn Kernel
 - Context Parallel with MoE
 - FP8 training support
-- AllGather dispatcher support for capacity bins
+- TEGroupedMLP support for HPU
 
 # User Guide
 
@@ -68,6 +66,8 @@
 | --moe-token-drop-policy | The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped. |
 | --moe-layer-recompute | Enable activation checkpointing for moe_layer, should be used when memory is not sufficient. |
 | --moe-extended-tp | (Experimental) Alternative parallelization strategy for expert parallelism. Instead of distributing experts across *expert_model_parallel_size*, each expert is sharded along extendended tensor parallel domain (tensor_model_paralle_size * expert_model_parallel_size). It avoids the load balancing problem with MOE training. Only available with `--moe-token-dispatcher-type allgather`. |
+| --moe-router-fp32 | Explicit casting of the router input to fp32 may be used to improve model accuracy and softmax numerical stablility. |
+| --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
 
 ### Capacity Bins - performance optimization in dropless scenario
 
@@ -87,13 +87,14 @@ with the `AllToAll` token dispatcher.
 | moe-capacity-bins-alignment | Every capacity bin value (initialized or optimized) will be a multiple of this alignment. Default is 64. |
 | moe-capacity-bins-oprimize-interval | Steps interval for auto-optimization of MoE capacity bins. Default is 300. |
 | moe-capacity-bins-oprimize-max-group | Maximum group size of adjacent MoE gates that their capacity bins are optimized jointly. Default is 4. |
+| moe-capacity-bins-max-overhead-factor | Value of capacity bins overhead that will trigger bins optimization. Overhead is defined as relative additional capacity used with bins, compared to requested capacity value. Default is 0.0. |
 
 ## Usage
 
 ### Quick Start
 To train a top-2 MoE model with 8 experts and auxiliary loss, include the following arguments:
 
-```python
+```bash
 --num-experts 8
 --expert-model-parallel-size 8
 --moe-grouped-gemm
@@ -101,29 +102,26 @@ To train a top-2 MoE model with 8 experts and auxiliary loss, include the follow
 --moe-router-topk 2
 --moe-aux-loss-coeff 1e-2
 --use-distributed-optimizer
-```
-
-To avoid out-of-memory in dropless MoE training, we can set a large capacity factor, add:
-
-```python
---moe-expert-capacity-factor 4.0
+--moe-token-dispatcher-type alltoall
 ```
 
 To enable the token drop mechanism, such as GShard and SwitchTransformer, include the following arguments:
 
-```python
+```bash
 --moe-expert-capacity-factor 1.0
 --moe-pad-expert-input-to-capacity # Optional
 ```
 
-To use a fixed set of capacity values instead of capacity factor, run:
+Instead of a fixed uniform capacity, use a discrete set of capacity values that will be asinged automatically to each expert per layer, minimizing redundant padding:
 
 ```python
 --moe-capacity-bins-num 10
+--moe-pad-expert-input-to-capacity # Required
 ```
 
-The following figure illustrates differenting dropping strategies in MCore:
-![Token Droppling Strategies](../../../../docs/source/images/moe/token_drop.png)
+The following figure illustrates different dropping strategies in MCore:
+<!-- This image is uncommented for now as Sphinx cannot resolve this path. Sphinx imports this markdown file, and from the imported location this relative path does not exist anymore. Ideally, this markdown should not live here but rather in the `docs/` directory that Sphinx uses. -->
+<!-- ![Token Droppling Strategies](../../../../docs/source/images/moe/token_drop.png) -->
 
 1. The default dropless strategy will not drop or pad any token.
 2. By setting `--moe-expert-capacity-factor`, the tokens exceed the capacity of expert will be dropped based on their selected probabilities.
@@ -151,6 +149,12 @@ Besides these limitations, Distributed Checkpointing is fully functional.
 Usage
 - `--use-dist-ckpt` The main argument, it will attempt to save and load using distributed checkpointing.
 - `--auto-detect-ckpt-format` With this, it can load both distributed checkpointing and legacy checkpointing.
+
+### Upcycling
+
+Use `--moe-use-upcycling` to enable the upcycling feature, which will load the dense model from the directory specified by `--load`, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.
+
+The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model.
 
 ## MoE training example:
 <details>
@@ -277,7 +281,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 
 # Performance Best Practice
 
-### Tuning Guide of Paralell Mappings
+### Tuning Guide of Parallel Mappings
 
 To find a good parallel mapping that help you achieve a high throughput of a new model, there are some general rule that could help. Here is an overview of properties in different aspects for each parallel strategy.
 

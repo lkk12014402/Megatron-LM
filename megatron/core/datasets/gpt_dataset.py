@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
@@ -113,14 +113,12 @@ class GPTDataset(MegatronDataset):
 
         try:
             self._pad_token_id = self.config.tokenizer.pad
-        except:
+        except Exception:
             self._pad_token_id = _PAD_TOKEN_ID
 
-        (
-            self.document_index,
-            self.sample_index,
-            self.shuffle_index,
-        ) = self._build_document_sample_shuffle_indices()
+        (self.document_index, self.sample_index, self.shuffle_index) = (
+            self._build_document_sample_shuffle_indices()
+        )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
@@ -375,7 +373,9 @@ class GPTDataset(MegatronDataset):
             sequence_length = self.config.sequence_length
             num_tokens_per_epoch = self._get_num_tokens_per_epoch()
             num_epochs = self._get_num_epochs(num_tokens_per_epoch)
-            shuffle_each_epoch_separately = self.config.shuffle_each_epoch_separately and num_epochs > 1
+            shuffle_each_epoch_separately = (
+                self.config.shuffle_each_epoch_separately and num_epochs > 1
+            )
 
             if num_epochs == 1:
                 separate_final_epoch = False
@@ -413,7 +413,9 @@ class GPTDataset(MegatronDataset):
                 )
 
             log_single_rank(
-                logger, logging.DEBUG, f"> shuffle_each_epoch_separately: {shuffle_each_epoch_separately}"
+                logger,
+                logging.DEBUG,
+                f"> shuffle_each_epoch_separately: {shuffle_each_epoch_separately}",
             )
 
             log_single_rank(
@@ -445,14 +447,21 @@ class GPTDataset(MegatronDataset):
             if shuffle_each_epoch_separately:
                 doc_idx_epochs, sample_idx_epochs, shuffle_idx_epochs = [], [], []
                 for _ in range(num_epochs):
-                    doc_idx_for_1epoch = _build_document_index(self.indices, 1, numpy_random_state, False)
+                    doc_idx_for_1epoch = _build_document_index(
+                        self.indices, 1, numpy_random_state, False
+                    )
                     assert doc_idx_for_1epoch.dtype == numpy.int32
 
                     # Build the sample index
                     sequence_lengths_for_cpp = get_sequence_lengths_for_cpp(doc_idx_for_1epoch)
                     sample_idx = helpers.build_sample_idx(
-                        sequence_lengths_for_cpp, doc_idx_for_1epoch, sequence_length, 1, num_tokens_per_epoch,
-                        drop_last_partial_sequence, self.config.add_extra_token_to_sequence,
+                        sequence_lengths_for_cpp,
+                        doc_idx_for_1epoch,
+                        sequence_length,
+                        1,
+                        num_tokens_per_epoch,
+                        drop_last_partial_sequence,
+                        self.config.add_extra_token_to_sequence,
                     )
 
                     # Build the shuffle index

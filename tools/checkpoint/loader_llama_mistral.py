@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import json
@@ -91,11 +91,6 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
         from transformers import LlamaConfig as ModelConfig
     elif "mistral" in model_size:
         from transformers import MistralConfig as ModelConfig
-        try:
-            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-        except ImportError:
-            raise ImportError("Module 'mistral-common' is required but not installed.")
-
 
     # for backward compatibility, before you needed the repo to be called `my_repo/model_size`
     if not os.path.isfile(os.path.join(input_base_path, "params.json")):
@@ -120,14 +115,8 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
 
     if "llama2" in model_size:
         tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
-    elif "llama3" in model_size:
-        try:
-            from llama.tokenizer import Tokenizer as Llama3Tokenizer
-        except ImportError:
-            raise AssertionError("Module 'llama' is required but not installed.")
-        tokenizer_class = Llama3Tokenizer
-    elif "mistral" in model_size:
-        tokenizer_class = MistralTokenizer
+    elif model_size in ["llama3", "mistral"]:
+        tokenizer_class = transformers.AutoTokenizer.from_pretrained
     else:
         raise AttributeError(f"model_size={model_size} not supported")
     if tokenizer_path is not None:
@@ -135,7 +124,9 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
             tokenizer = tokenizer_class(tokenizer_path)
             if "llama2" in model_size:
                 tokenizer.save_pretrained(model_path)
-            vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
+                vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
+            elif "llama3" in model_size:
+                vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 128256
         elif "mistral" in model_size:
             tokenizer = tokenizer_class.from_file(tokenizer_path)
             vocab_size = 32768
@@ -160,11 +151,11 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if num_shards == 1:
         # Not sharded
         # (The sharded implementation would also work, but this is simpler.)
-        loaded = torch.load(os.path.join(input_base_path, "consolidated.00.pth"), map_location=device)
+        loaded = torch.load(os.path.join(input_base_path, "consolidated.00.pth"), map_location=device, weights_only=False)
     else:
         # Sharded
         loaded = [
-            torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location=device)
+            torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location=device, weights_only=False)
             for i in range(num_shards)
         ]
     param_count = 0
@@ -319,8 +310,7 @@ def load_args_from_checkpoint(args):
     args.global_batch_size = 1024
     args.norm_epsilon = model_args["rms_norm_eps"]
     args.iteration = 1 # '0', 'release' don't work
-    args.add_position_embedding = False
-    args.use_rotary_position_embeddings = True
+    args.position_embedding_type = "rope"
     args.swiglu = True
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
@@ -439,15 +429,9 @@ def load_checkpoint_to_model(args):
     '''Set model params.'''
 
     from pretrain_gpt import model_provider
-    if "llama" in args.model_size or "yi" in args.model_size:
-        from transformers import LlamaForCausalLM as ModelForCausalLM
-    elif "mistral" in args.model_size:
-        from transformers import MistralForCausalLM as ModelForCausalLM
-    else:
-        raise AttributeError(f"args.model_size={args.model_size} not supported")
 
     # Load Huggingface model.
-    hf_model = ModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map=device)
+    hf_model = transformers.AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map=device)
 
     # Init Megatron model.
     model = model_provider(True, True).to(args.params_dtype).to(device)
@@ -481,7 +465,7 @@ def _load_checkpoint(queue, args):
 
     try:
         from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables, get_tokenizer
+        from megatron.training.global_vars import set_global_variables
         from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
@@ -515,9 +499,9 @@ def _load_checkpoint(queue, args):
     if "llama2" in args.model_size or "yi" in args.model_size:
         margs.tokenizer_type = "Llama2Tokenizer"
     elif "llama3" in args.model_size:
-        margs.tokenizer_type = "Llama3Tokenizer"
+        margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "mistral" in args.model_size:
-        margs.tokenizer_type = "MistralTokenizer"
+        margs.tokenizer_type = "HuggingFaceTokenizer"
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
@@ -556,6 +540,8 @@ def _load_checkpoint(queue, args):
         print("Argument `--source-margs-file` is not set or path doesn't exit. Default megatron arguments would be set.")
 
     margs.params_dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+
+    margs.position_embedding_type = "rope"
 
     def check_for_arg(arg_name, default=None):
         if getattr(margs, arg_name, None) is None:
@@ -629,16 +615,8 @@ def _load_checkpoint(queue, args):
     margs.model_size = args.model_size
 
     # Get true (non-padded) vocab size
-    if margs.tokenizer_model is not None and "llama3" in args.model_size:
-        try:
-            from llama.tokenizer import Tokenizer as Llama3Tokenizer
-        except ImportError:
-            raise AssertionError("Module 'llama' is required but not installed.")
-
-        tokenizer = get_tokenizer()
-        md.true_vocab_size = tokenizer.vocab_size
-    else:
-        md.true_vocab_size = None
+    tokenizer = transformers.AutoTokenizer.from_pretrained(margs.tokenizer_model)
+    md.true_vocab_size = tokenizer._tokenizer.get_vocab_size(with_added_tokens=True)
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
@@ -748,6 +726,6 @@ def _load_checkpoint(queue, args):
 def load_checkpoint(queue, args):
     try:
         _load_checkpoint(queue, args)
-    except:
+    except Exception:
         queue.put("exit")
         raise

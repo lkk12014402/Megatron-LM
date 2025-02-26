@@ -1,19 +1,21 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import OrderedDict, Union
+from typing import Any, OrderedDict, Union
 
 import torch
+import torch.distributed
+from torch import Tensor
 
 from megatron.core import parallel_state
-from megatron.core.aux_loss import aux_losses_tracker_save, aux_losses_tracker_track_metrics
+from megatron.core.aux_loss import aux_losses_tracker_track_metrics
 from megatron.core.parallel_state import (
     get_expert_model_parallel_group,
     get_tensor_and_expert_parallel_group,
 )
 from megatron.core.transformer.moe.capacity_bins import CapacityBins, optimize_bins
-from megatron.core.utils import is_real_cuda_device_available
+from megatron.core.utils import is_lazy_mode, is_real_cuda_device_available
 
 
 def switch_load_balancing_loss_func(
@@ -300,25 +302,25 @@ def unpermute_with_padded_tokens(
     """
     # Ensure permuted_tokens is 2D
     assert permuted_tokens.dim() == 2, f"Got {permuted_tokens.dim()}D."
-
-    # Reshape and expand probabilities and indices to match permuted_tokens
-    probs = probs.view(-1).unsqueeze(-1)
-    indices = indices.view(-1, 1).expand(-1, permuted_tokens.shape[1])
-    assert (
-        permuted_tokens.shape == indices.shape
-    ), "Shape mismatch between permuted_tokens and indices."
-
-    # Combine tokens with their probabilities
-    combined_output = probs * permuted_tokens
-
-    # Prepare a tensor of zeros with the desired output shape
-    empty_tokens = torch.zeros(
-        restore_shape, dtype=combined_output.dtype, device=combined_output.device
-    )
+    if probs is not None:
+        # Reshape and expand probabilities and indices to match permuted_tokens
+        probs = probs.view(-1).unsqueeze(-1)
+        # Combine tokens with their probabilities
+        permuted_tokens = probs * permuted_tokens
 
     # Scatter the combined tokens back to their original positions
-    unpermuted_tokens = torch.scatter_add(empty_tokens, 0, indices, combined_output)
-
+    if is_lazy_mode():
+        indices = indices.flatten()
+        assert (
+            permuted_tokens.shape[0] == indices.shape[0]
+        ), f"Shape mismatch between permuted_tokens and indices."
+        unpermuted_tokens = moe_scatter_1d.apply(permuted_tokens, indices, restore_shape)
+    else:
+        indices = indices.view(-1, 1).expand(-1, permuted_tokens.shape[1])
+        assert (
+            permuted_tokens.shape == indices.shape
+        ), "Shape mismatch between permuted_tokens and indices."
+        unpermuted_tokens = moe_scatter.apply(permuted_tokens, indices, restore_shape)
     return unpermuted_tokens
 
 
@@ -379,16 +381,15 @@ def topk_softmax_with_capacity(
         scores, top_indices = torch.topk(logits, k=topk, dim=1)
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
 
+    # TopK selection, maskout unused experts
+    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
+    topk_mask = torch.zeros_like(logits).scatter(1, top_indices, 1)
+    tokens_per_expert_before_capacity = topk_mask.sum(dim=0)
+
     if capacity_factor is None and capacity_bins is None:  # keep all tokens
-        # TopK without capacity
-        tokens_per_expert = torch.bincount(top_indices.view(-1), minlength=num_experts)
-        return probs, top_indices, tokens_per_expert
+        return probs, top_indices, tokens_per_expert_before_capacity
 
     else:
-        # TopK selection, maskout unused experts
-        topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
-        topk_mask = torch.zeros_like(logits).scatter(1, top_indices, 1)
-        tokens_per_expert_before_capacity = topk_mask.sum(dim=0)
 
         if capacity_bins is None:
             # TopK with capacity factor
@@ -497,9 +498,7 @@ def reduce_aux_losses_tracker_across_ranks():
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
-                values,
-                group=tracker[name]['avg_group'],
-                op=torch.distributed.ReduceOp.AVG,
+                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
 
 
@@ -520,6 +519,125 @@ def track_moe_metrics(
         per_layer_logging,
         per_layer_prefix='moe/',
     )
+
+
+def save_token_distribution_tracker(
+    name: str,
+    tokens_per_expert: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+    reduce_group: torch.distributed.ProcessGroup = None,
+):
+    """Save the token distribution for logging.
+    Args:
+        name (str): The name of the token distribution.
+        tokens_per_expert (torch.Tensor): Token distribution tensor.
+        layer_number (int): Layer index of the token distribution.
+        num_layers (int): The number of total layers.
+        reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
+    """
+    # Skip token distribution logging if layer_number is None.
+    if layer_number is None:
+        return
+
+    tracker = parallel_state.get_moe_token_distribution_logging_tracker()
+    if name not in tracker:
+        tracker[name] = {}
+        values_shape = (num_layers, tokens_per_expert.size(-1))
+        tracker[name]['values'] = torch.zeros(
+            values_shape, device=tokens_per_expert.device, dtype=tokens_per_expert.dtype
+        )
+    tracker[name]['values'][layer_number - 1] += tokens_per_expert.clone().detach().to(torch.long)
+    tracker[name]['reduce_group'] = reduce_group
+
+
+def generate_per_layer_token_distribution(history: list[Tensor]) -> list[Tensor]:
+    # history: List[Tensor[num_layers, num_experts]]
+    if not history:
+        return []
+    num_layers = history[0].size(0)
+    per_layer_token_distribution = []
+    for i in range(num_layers):
+        tokens_per_expert = torch.stack([history[j][i] for j in range(len(history))], dim=0)
+        per_layer_token_distribution.append(tokens_per_expert)
+
+    return per_layer_token_distribution
+
+
+def generate_token_distribution_log(name: str, per_layer_token_distribution: list[Tensor]) -> str:
+    from tabulate import tabulate
+
+    console_log = f'{name}:\n'
+    for layer, tokens_per_expert in enumerate(per_layer_token_distribution):
+        console_log += f'Layer {layer + 1}:\n'
+        console_log += tabulate(
+            tokens_per_expert.tolist(),
+            headers=[f'Expert {i}' for i in range(tokens_per_expert.size(1))],
+            tablefmt='github',
+        )
+        console_log += '\n'
+    return console_log
+
+
+def write_token_distribution_plot(
+    name: str, per_layer_token_distribution: list[Tensor], writer: Any, iteration: int
+):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    for layer, tokens_per_expert in enumerate(per_layer_token_distribution):
+        tokens_per_expert = (tokens_per_expert - tokens_per_expert.min()) / (
+            tokens_per_expert.max() - tokens_per_expert.min()
+        )
+        figure_name = f'{name}_layer_{layer}'
+        plt.figure(figsize=(10, 6))
+        sns.heatmap(tokens_per_expert.numpy(), annot=False, cmap='Blues')
+        plt.title(figure_name)
+        plt.xlabel('Experts')
+        figure = plt.gcf()
+        writer.add_figure(figure_name, figure, iteration)
+        plt.close(figure)
+
+
+def track_moe_token_distribution_metrics(
+    report_token_distribution_flag: bool, iteration: int, writer: Any
+) -> str:
+    tracker = parallel_state.get_moe_token_distribution_logging_tracker()
+
+    # reduce values
+    for name in tracker:
+        if tracker[name].get('reduce_group') is not None:
+            torch.distributed.all_reduce(
+                tracker[name]['values'],
+                torch.distributed.ReduceOp.SUM,
+                group=tracker[name].get('reduce_group'),
+            )
+
+    # save history
+    for name in tracker:
+        if 'history' not in tracker[name]:
+            tracker[name]['history'] = []
+    for name in tracker:
+        values = tracker[name]['values'].cpu()
+        tracker[name]['history'].append(values)
+    console_log = ''
+    if report_token_distribution_flag:
+        for name in tracker:
+            per_layer_token_distribution = generate_per_layer_token_distribution(
+                tracker[name]['history']
+            )
+            console_log += generate_token_distribution_log(name, per_layer_token_distribution)
+            if writer is not None:
+                write_token_distribution_plot(name, per_layer_token_distribution, writer, iteration)
+            # clear history
+            tracker[name]['history'] = []
+
+    # clear values, keep history
+    for name in tracker:
+        tracker[name]["values"].zero_()
+        tracker[name]["reduce_group"] = None
+
+    return console_log
 
 
 class moe_gather(torch.autograd.Function):
@@ -543,6 +661,29 @@ class moe_gather(torch.autograd.Function):
         )
         output.scatter_add_(0, map_, grad_output)
         return output, None, None
+
+
+class moe_scatter_1d(torch.autograd.Function):
+    """Scatter the input tensor based on the map tensor."""
+
+    @staticmethod
+    def forward(ctx, input_, map_, output_size_=None):
+        # ctx, unpermuted_tokens, indices, output_size
+        """Scatter the input tensor based on the map tensor."""
+        ctx.save_for_backward(map_)
+        # Prepare a tensor of zeros with the desired output shape
+        if output_size_ is not None:
+            output_ = torch.zeros(output_size_, dtype=input_.dtype, device=input_.device)
+        else:
+            output_ = torch.zeros_like(input_)
+        return output_.scatter_add_(0, map_, input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Gather the grad_output tensor based on the map tensor."""
+        map_ = ctx.saved_tensors[0]
+        grad_input = torch.index_select(grad_output, 0, map_)
+        return grad_input, None, None, None
 
 
 class moe_scatter(torch.autograd.Function):
@@ -575,6 +716,7 @@ def optimize_moe_capacity(
     num_experts,
     step,
     max_grouped_experts: int = 4,
+    max_overhead_factor: float = 0.0,
 ):
     """Optimize MoE gate capacity bins
 
@@ -595,7 +737,7 @@ def optimize_moe_capacity(
     for i in gate_with_capacity_bins_idx:
         gate = gate_modules[i]
         if hasattr(gate, 'get_stats'):
-            stats = gate.get_stats(incremental=False)
+            stats = gate.get_stats(bins_state_name='optimize_moe')
             if stats is not None and 'capacity_bins' in stats:
                 gate_capacity_bin_stats[i] = stats['capacity_bins']
     if len(gate_capacity_bin_stats) == 0:
@@ -624,9 +766,18 @@ def optimize_moe_capacity(
 
     # for each group, (1) accumulate stats (2) calculate optimized capacity and (3) reconfigure bins
     for gate_group in gate_groups:
+        skip_bins_optimization = True
         group_stats = []
         for i in gate_group:
             group_stats.append(gate_capacity_bin_stats[i])
+            # Update a group only if at least one gates capacity overhead is above the threshold.
+            skip_bins_optimization &= (
+                'capacity_overhead_factor' in gate_capacity_bin_stats[i]
+                and gate_capacity_bin_stats[i]['capacity_overhead_factor'] <= max_overhead_factor
+            )
+
+        if skip_bins_optimization:
+            continue
 
         # sanity - verify all gates in groups have same bins edges
         bins_edges = [stats['edges'] for stats in group_stats]

@@ -49,17 +49,18 @@ python $MEGATRON_LM_ROOT/tools/checkpoint/convert_mlm_to_hf_checkpoint.py \
 --save-path "/path/to/save/hf_checkpoints/"
 ```
 
-## [LLaMA] Convert Hugging Face to Megatron-LM checkpoint
+## Convert Hugging Face to Megatron-LM checkpoint
 
-This tool converts Hugging Face checkpoints to the Megatron-LM for LLaMA recipes.
+The following recipes are supported by the Checkpoint converter:
+- LLaMA 2, 3 & 3.1,
+- Mixtral.
 
 ### Checkpoint conversion process
 
-- Hugging face format supports single-node checkpoint and doesn't have a notion of tensor parallel and pipeline parallel checkpoint shards. Hugging Face format ideally stores model weights and model configuration required for inference, fine-tuning and transfer learning. It doesn't store any details regarding distributed training regime and its configuration as it is not relevant.
+- Hugging face format supports single-node checkpoint and doesn't have a notion of tensor parallel, pipeline parallel or expert parallel (in case of Mixtral) checkpoint shards. Hugging Face format ideally stores model weights and model configuration required for inference, fine-tuning and transfer learning. It doesn't store any details regarding distributed training regime and its configuration as it is not relevant.
 - This process undergoes a loader and saver approach, `convert.py` is a connecting link between both the loader and saver module shared by torch multiprocessing queue.
 - Queue is a shared object between both the process. loader enqueues the loaded checkpoint states and saver fetches, persists them in a Megatron GPT format.
-- Loader expects tensor parallel and pipeline parallel size to be 1 and saver can have any megatron compatible tensor and pipeline parallel ranks. (Easier to go from TP1 PP1 → TP8 PP4)
-
+- Loader expects tensor parallel and pipeline parallel size to be 1 and saver can have any megatron compatible tensor, pipeline or expert parallel ranks. (Easier to go from TP1 PP1 → TP8 PP4).
 
 ### Prerequisites
 Python >= 3.10
@@ -73,7 +74,7 @@ pip install -r $MEGATRON_LM_ROOT/megatron/core/requirements.txt
 pip install -r $MEGATRON_LM_ROOT/tools/checkpoint/requirements.txt
 ```
 
-### Usage
+### [LLama] Usage
 To convert the distributed Hugging Face checkpoints into Megatron-LM format, run the following command:
 
 ```bash
@@ -88,11 +89,33 @@ python $MEGATRON_LM_ROOT/tools/checkpoint/convert.py \
 --loader-transformer-impl local \
 --saver-transformer-impl transformer_engine \
 --target-tensor-parallel-size $TP \
---target-pipeline-parallel-size $DP \
+--target-pipeline-parallel-size $PP \
 --checkpoint-type hf \
 --source-margs-file "/path/to/hf/checkpoints/source_megatron_args.json" \
 --load-dir "/path/to/hf/checkpoints" \
 --save-dir "/path/to/save/mlm/checkpoint" \
 --tokenizer-model "/path/to/tokenizer/model" \
 --model-size llama3-70B
+```
+
+### [Mixtral] Usage
+To convert the distributed Hugging Face checkpoints into Megatron-LM format, run the following command:
+
+```bash
+# To get more details on supported arguments.
+python $MEGATRON_LM_ROOT/tools/checkpoint/convert.py --help
+
+python $MEGATRON_LM_ROOT/tools/checkpoint/convert.py \
+--bf16 \
+--model-type GPT \
+--loader mixtral_hf \
+--saver mcore \
+--saver-transformer-impl transformer_engine \
+--target-tensor-parallel-size $TP \
+--target-pipeline-parallel-size $PP \
+--target-expert-paralell-size $EP \
+--source-margs-file "/path/to/hf/checkpoints/source_megatron_args.json" \
+--load-dir "/path/to/hf/checkpoints" \
+--save-dir "/path/to/save/mlm/checkpoint" \
+--tokenizer-model "/path/to/tokenizer/model"
 ```

@@ -1,6 +1,6 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+#!/bin/bash
 
-#! /bin/bash
+# © 2024-2025 Intel Corporation
 
 # -------------------------------------------
 # Mixtral model
@@ -27,6 +27,7 @@ DEVICES_PER_NODE=${HL_DEVICES_PER_NODE:-8}
 DP=${HL_DP:-1}
 TP=${HL_TP:-8}
 PP=${HL_PP:-1}
+CP=${HL_CP:-1}
 MOE_EP=${HL_MOE_EP:-}
 MOE_TP=${HL_MOE_TP:-}
 SEQ_PARALLEL=${HL_SEQ_PARALLEL:-0}
@@ -40,38 +41,51 @@ MICRO_BATCH=${HL_MICRO_BATCH:-1}
 OPTIMIZER=${HL_OPTIMIZER:-fusedadamw}
 DROPOUT=${HL_DROPOUT:-0.0}
 LR_WARMUP_ITERS=${HL_LR_WARMUP_ITERS:-2000}
+USE_CPU_INIT=${HL_USE_CPU_INIT:-0}
 
 MOE_EXPERT_CAPACITY_FACTOR=${HL_MOE_EXPERT_CAPACITY_FACTOR:-}
 MOE_TOKEN_DROP_POLICY=${HL_MOE_TOKEN_DROP_POLICY:-probs}  # either probs or position
 MOE_PAD_EXPERT_INPUT_TO_CAPACITY=${HL_MOE_PAD_EXPERT_INPUT_TO_CAPACITY:-0}
 MOE_TOPK=${HL_MOE_TOPK:-2}
 MOE_ZLOSS_COEFF=${HL_MOE_ZLOSS_COEFF:-}
+MOE_AUX_LOSS_COEFF=${HL_MOE_AUX_LOSS_COEFF:-2e-2}
+MOE_TOKEN_DISTRIBUTION_LOGGING=${HL_MOE_TOKEN_DISTRIBUTION_LOGGING:-0}
+MOE_TOKEN_DISTRIBUTION_LOGGING_INTERVAL=${HL_MOE_TOKEN_DISTRIBUTION_LOGGING_INTERVAL:-50}
+MOE_ROUTER_PRE_SOFTMAX=${HL_MOE_ROUTER_PRE_SOFTMAX:-1}
+MOE_ROUTER_FP32=${HL_MOE_ROUTER_FP32:-1}
+MOE_DYNAMIC=${HL_MOE_DYNAMIC:-0}
+MOE_PERMUTED_WEIGHTS=${HL_MOE_PERMUTED_WEIGHTS:-1}
+MOE_FUSED_WEIGHTS=${HL_MOE_FUSED_WEIGHTS:-1}
 
 MOE_NUM_CAPACITY_BINS=${HL_MOE_NUM_CAPACITY_BINS:-10}
 MOE_CAPACITY_BINS=${HL_MOE_CAPACITY_BINS:-}
-MOE_CAPACITY_BINS_EXP_BASE=${HL_CAPACITY_BINS_EXP_BASE:-1.5}
+MOE_CAPACITY_BINS_EXP_BASE=${HL_MOE_CAPACITY_BINS_EXP_BASE:-1.5}
 MOE_CAPACITY_BINS_ALIGNMENT=${HL_MOE_CAPACITY_BINS_ALIGNMENT:-64}
 MOE_CAPACITY_BINS_OPTIMIZE_INTERVAL=${HL_MOE_CAPACITY_BINS_OPTIMIZE_INTERVAL:-300}
 MOE_CAPACITY_BINS_OPTIMIZE_MAX_GROUP=${HL_MOE_CAPACITY_BINS_OPTIMIZE_MAX_GROUP:-4}
+MOE_CAPACITY_BINS_MAX_OVERHEAD_FACTOR=${HL_MOE_CAPACITY_BINS_MAX_OVERHEAD_FACTOR:-0.0}
 
 USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
 USE_TORCH_COMPILE=${HL_USE_TORCH_COMPILE:-0}
+USE_TORCH_COMPILED_AUTOGRAD=${HL_USE_TORCH_COMPILED_AUTOGRAD:-0}
 
 USE_FUSED_SDPA=${HL_USE_FUSED_SDPA:-1}
 USE_FUSED_SDPA_WITH_RECOMPUTE=${HL_USE_FUSED_SDPA_WITH_RECOMPUTE:-0}
 USE_FUSED_RMSNORM=${HL_USE_FUSED_RMSNORM:-1}
-USE_FAST_SOFTMAX=${HL_USE_FAST_SOFTMAX:-0}
+USE_FAST_SOFTMAX=${HL_USE_FAST_SOFTMAX:-1}
+USE_FLASH_ATTN=${HL_USE_FLASH_ATTN:-0}
 
 CKP_ACT=${HL_CKP_ACT:-0}
 RECOMPUTE_NUM_LAYERS=${HL_RECOMPUTE_NUM_LAYERS:-1}
 
 CHECKPOINT_SAVE=${HL_SAVE:-0}
 SAVE_INTERVAL=${HL_SAVE_INTERVAL:-2000}
-USE_DIST_CKPT=${HL_USE_DIST_CKPT:-0}
-DIST_CKPT_FORMAT=${HL_DIST_CKPT_FORMAT:-torch_dist}
+CKPT_FORMAT=${HL_CKPT_FORMAT:-torch} # torch, torch_dist and zarr
 OVERRIDE_OPT_PARAM_SCHEDULER=${HL_OVERRIDE_OPT_PARAM_SCHEDULER:-0}
 USE_CKPT_OPT_PARAM_SCHEDULER=${HL_USE_CKPT_OPT_PARAM_SCHEDULER:-0}
 NO_LOAD_STRICT=${HL_NO_LOAD_STRICT:-0}
+NO_LOAD_OPTIM=${HL_NO_LOAD_OPTIM:-0}
+NO_LOAD_RNG=${HL_NO_LOAD_RNG:-0}
 LOAD_DIR=${HL_LOAD_DIR:-}
 CHECKPOINTS_DIR=${HL_CHECKPOINTS_DIR:-}
 TENSORBOARD_DIR=${HL_TENSORBOARD_DIR:-}
@@ -86,10 +100,12 @@ PROFILE_STEP_START=${HL_PROFILE_STEP_START:-3}
 PROFILE_STEP_END=${HL_PROFILE_STEP_END:-4}
 
 FP8=${HL_FP8:-0}
+BF16=${HL_BF16:-1}
 TRANSFORMER_IMPL=${HL_TRANSFORMER_IMPL:-transformer_engine}
 FP8_FORMAT=${HL_FP8_FORMAT:-hybrid} # hybrid or e5m2
 FP8_MARGIN=${HL_FP8_MARGIN:-0}
 FP8_AMAX_COMPUTE_ALGO=${HL_FP8_AMAX_COMPUTE_ALGO:-max} # max or most_recent
+FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False attention=True"}
 
 NUM_WORKERS=${HL_NUM_WORKERS:-0}
 
@@ -123,10 +139,10 @@ fi
 # ------------------------------
 # Verify supported configuration
 
-NUM_DEVICES=$(($DP * $TP * $PP))
+NUM_DEVICES=$(($DP * $TP * $PP * $CP))
 NUM_DEVICES_GOT=$(($DEVICES_PER_NODE * $NUM_NODES))
 if [ $NUM_DEVICES -ne $NUM_DEVICES_GOT ]; then
-    echo "Bad devices configuration. DPxTPxPP=${NUM_DEVICES} != N_NODES*N_DEVICES_PER_NODE=${NUM_DEVICES_GOT}"
+    echo "Bad devices configuration. DPxTPxPPxCP=${NUM_DEVICES} != N_NODES*N_DEVICES_PER_NODE=${NUM_DEVICES_GOT}"
     exit 1
 fi
 
@@ -148,11 +164,6 @@ if [ -z "${MOE_EP}" ]; then
   fi
 fi
 
-if [[ "$USE_LAZY_MODE" = 1 && "$USE_TORCH_COMPILE" = 1 ]]; then
-    echo "Cannot use lazy(HL_USE_LAZY_MODE) and torch.compile(HL_USE_TORCH_COMPILE) modes together"
-    exit 1
-fi
-
 if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
     if [[ ! -z $MOE_EXPERT_CAPACITY_FACTOR ]]; then
         echo "Using either Capacity Bins or Capacity Factor for MoE Expert capacity."
@@ -161,6 +172,16 @@ if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
     echo "Using either Capacity Bins. Capacity factor value will be ignored. Token padding is done by default."
     MOE_EXPERT_CAPACITY_FACTOR=""
     MOE_PAD_EXPERT_INPUT_TO_CAPACITY=1
+fi
+
+if [[ "$TOKEN_DISPATCHER_TYPE" != "alltoall" ]]; then
+    echo "Unsupported token disptacher selected. Please use 'alltoall'."
+    # TODO: SW-206636
+    exit 1
+fi
+
+if [[ "${USE_FUSED_SDPA}" = "1" || "${USE_FUSED_SDPA_WITH_RECOMPUTE}" = "1" ]]; then
+    CMD="${CMD} --no-create-attention-mask-in-dataloader"
 fi
 
 echo "Using Num Experts=${MOE_NUM_EXPERTS} with MoE EP=${MOE_EP}"
@@ -197,7 +218,7 @@ if [ -z "$OUTPUT_DIR" ]; then
     if [ -z "$EXP_NAME" ]; then
         EXP_NAME="default"
     fi
-    OUTPUT_DIR=${OUTPUT_DIR_PREFIX}/out/mixtral_${MIXTRAL_MODEL}/${EXP_NAME}_nl${NUM_LAYERS}_hs${HIDDEN_SIZE}_ffn${FFN_HIDDEN_SIZE}_moe_exp${MOE_NUM_EXPERTS}_gb${GLOBAL_BATCH}_mb${MICRO_BATCH}_sp${SEQ_PARALLEL}_D${DP}_T${TP}_P${PP}_E${MOE_EP}_devices${NUM_DEVICES}_${RUNTIME}
+    OUTPUT_DIR=${OUTPUT_DIR_PREFIX}/out/mixtral_${MIXTRAL_MODEL}/${EXP_NAME}_ckpact${CKP_ACT}_nl${NUM_LAYERS}_hs${HIDDEN_SIZE}_ffn${FFN_HIDDEN_SIZE}_moe_exp${MOE_NUM_EXPERTS}_gb${GLOBAL_BATCH}_mb${MICRO_BATCH}_sp${SEQ_PARALLEL}_D${DP}_T${TP}_P${PP}_E${MOE_EP}_devices${NUM_DEVICES}_${RUNTIME}
 fi
 
 if [ -z "$CHECKPOINTS_DIR" ]; then
@@ -280,7 +301,9 @@ MLM_SCRIPT="${MEGATRON_LM_ROOT}/pretrain_gpt.py"
 
 CMD="${CMD} \
     python ${MLM_SCRIPT} \
+    --transformer-impl ${TRANSFORMER_IMPL} \
     --use-torch-compile ${USE_TORCH_COMPILE} \
+    --use-torch-compiled-autograd ${USE_TORCH_COMPILED_AUTOGRAD} \
     --use-mcore-models \
     --disable-bias-linear \
     --seq-length ${SEQ_LEN} \
@@ -298,7 +321,6 @@ CMD="${CMD} \
     --swiglu \
     --untie-embeddings-and-output-weights \
     --no-masked-softmax-fusion \
-    --transformer-impl local \
     --no-bias-gelu-fusion \
     --no-bias-dropout-fusion \
     --no-gradient-accumulation-fusion \
@@ -307,6 +329,9 @@ CMD="${CMD} \
     --use-fused-rmsnorm ${USE_FUSED_RMSNORM} \
     --micro-batch-size ${MICRO_BATCH} \
     --global-batch-size ${GLOBAL_BATCH} \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --rotary-base 1000000 \
     --lr ${LR} \
     --min-lr ${MIN_LR} \
     --lr-decay-style cosine \
@@ -314,10 +339,10 @@ CMD="${CMD} \
     --weight-decay 0.1 \
     --train-iters ${TRAIN_ITERS} \
     --clip-grad 1.0 \
-    --bf16 \
     --optimizer ${OPTIMIZER} \
     --tensor-model-parallel-size ${TP} \
     --pipeline-model-parallel-size ${PP} \
+    --context-parallel-size ${CP} \
     --expert-model-parallel-size ${MOE_EP} \
     --log-interval ${LOG_INTERVAL} \
     --eval-interval ${EVAL_INTERVAL} \
@@ -328,11 +353,23 @@ CMD="${CMD} \
     --log-throughput \
     --tensorboard-dir ${TENSORBOARD_DIR} \
     --log-validation-ppl-to-tensorboard \
-    --log-batch-size-to-tensorboard \
     --log-timers-to-tensorboard \
     --num-workers ${NUM_WORKERS} \
     --use-fast-softmax ${USE_FAST_SOFTMAX} \
     "
+
+# -------------
+# Precision fp32->bf16
+if [ $BF16 -eq 1 ]; then
+    CMD="${CMD} --bf16"
+fi
+
+# -------------
+# Flash Attention
+
+if [ $USE_FLASH_ATTN -eq 1 ]; then
+    CMD="${CMD} --use-flash-attn"
+fi
 
 # -------------
 # MoE arguments
@@ -340,17 +377,40 @@ CMD="${CMD} \
 CMD="${CMD} --num-experts ${MOE_NUM_EXPERTS}"
 CMD="${CMD} --moe-router-topk ${MOE_TOPK}"
 CMD="${CMD} --moe-router-load-balancing-type aux_loss"
-CMD="${CMD} --moe-aux-loss-coeff 2e-2"
+CMD="${CMD} --moe-aux-loss-coeff ${MOE_AUX_LOSS_COEFF}"
 CMD="${CMD} --moe-token-dispatcher-type ${TOKEN_DISPATCHER_TYPE}"
+if [ -n "$MOE_ZLOSS_COEFF" ]; then
+    CMD="${CMD} --moe-z-loss-coeff ${MOE_ZLOSS_COEFF}"
+fi
+if [ $MOE_TOKEN_DISTRIBUTION_LOGGING -eq 1 ]; then
+    CMD="${CMD} --moe-token-distribution-logging"
+    CMD="${CMD} --moe-token-distribution-logging-interval ${MOE_TOKEN_DISTRIBUTION_LOGGING_INTERVAL}"
+fi
+if [ $MOE_ROUTER_PRE_SOFTMAX -eq 1 ]; then
+    CMD="${CMD} --moe-router-pre-softmax"
+fi
+if [ $MOE_ROUTER_FP32 -eq 1 ]; then
+    CMD="${CMD} --moe-router-fp32"
+fi
+if [ $MOE_DYNAMIC -eq 1 ]; then
+    CMD="${CMD} --moe-dynamic-hpu"
+    if [ $MOE_PERMUTED_WEIGHTS -eq 1 ]; then
+        CMD="${CMD} --moe-permuted-weights"
+    fi
+    if [ $MOE_FUSED_WEIGHTS -eq 1 ]; then
+        CMD="${CMD} --moe-fused-weights"
+    fi
+    echo "While using Dynamic MoE HPU Kernel - IntelDynamicMLP capacity settings and padding are set to None!"
+    MOE_NUM_CAPACITY_BINS=0
+    MOE_PAD_EXPERT_INPUT_TO_CAPACITY=""
+    MOE_EXPERT_CAPACITY_FACTOR=""
+fi
 if [ ! -z "$MOE_EXPERT_CAPACITY_FACTOR" ]; then
     CMD="${CMD} --moe-expert-capacity-factor ${MOE_EXPERT_CAPACITY_FACTOR}"
     CMD="${CMD} --moe-token-drop-policy ${MOE_TOKEN_DROP_POLICY}"
 fi
 if [ $MOE_PAD_EXPERT_INPUT_TO_CAPACITY -eq 1 ]; then
     CMD="${CMD} --moe-pad-expert-input-to-capacity"
-fi
-if [ -n "$MOE_ZLOSS_COEFF" ]; then
-    CMD="${CMD} --moe-z-loss-coeff ${MOE_ZLOSS_COEFF}"
 fi
 
 # ---------------------------
@@ -363,6 +423,7 @@ if [[ $MOE_NUM_CAPACITY_BINS -gt 0 ]]; then
     CMD="${CMD} --moe-capacity-bins-alignment ${MOE_CAPACITY_BINS_ALIGNMENT}"
     CMD="${CMD} --moe-capacity-bins-optimize-interval ${MOE_CAPACITY_BINS_OPTIMIZE_INTERVAL}"
     CMD="${CMD} --moe-capacity-bins-optimize-max-group ${MOE_CAPACITY_BINS_OPTIMIZE_MAX_GROUP}"
+    CMD="${CMD} --moe-capacity-bins-max-overhead-factor ${MOE_CAPACITY_BINS_MAX_OVERHEAD_FACTOR}"
 fi
 
 if [ ! -z "$MOE_CAPACITY_BINS" ]; then
@@ -407,10 +468,7 @@ fi
 if [ $CHECKPOINT_SAVE -eq 1 ]; then
     CMD="${CMD} --save ${CHECKPOINTS_DIR}"
     CMD="${CMD} --save-interval ${SAVE_INTERVAL}"
-    if [ $USE_DIST_CKPT -eq 1 ]; then
-        CMD="${CMD} --use-dist-ckpt"
-        CMD="${CMD} --dist-ckpt-format ${DIST_CKPT_FORMAT}"
-    fi
+    CMD="${CMD} --ckpt-format ${CKPT_FORMAT}"
 fi
 
 if [[ $OVERRIDE_OPT_PARAM_SCHEDULER -eq 1 && $USE_CKPT_OPT_PARAM_SCHEDULER -eq 1 ]]; then
@@ -426,6 +484,12 @@ fi
 
 if [ $NO_LOAD_STRICT -eq 1 ]; then
     CMD="${CMD} --no-load-strict"
+fi
+if [ $NO_LOAD_OPTIM -eq 1 ]; then
+    CMD="${CMD} --no-load-optim"
+fi
+if [ $NO_LOAD_RNG -eq 1 ]; then
+    CMD="${CMD} --no-load-rng"
 fi
 
 if [ "$TOKENIZER_TYPE" = "GPTSentencePieceTokenizer" ]; then
@@ -444,19 +508,24 @@ if [ ! -z "$CACHE_PATH" ]; then
     CMD="${CMD} --data-cache-path ${CACHE_PATH}"
 fi
 
+if [ $USE_CPU_INIT -eq 1 ]; then
+    CMD="${CMD} --use-cpu-initialization"
+fi
+
 # fp8 args
 if [[ "${TRANSFORMER_IMPL}" == "transformer_engine" && $FP8 -eq 1 ]]; then
     FP8_MEASURE_INTERVAL=${HL_FP8_MEASURE_INTERVAL:-$(( GLOBAL_BATCH / MICRO_BATCH / DP ))}
     FP8_AMAX_HISTORY_LEN=${HL_FP8_AMAX_HISTORY_LEN:-$(( GLOBAL_BATCH / MICRO_BATCH / DP ))}
+    FP8_AMAX_REDUCE=${HL_FP8_AMAX_REDUCE:-1}
 
     CMD="${CMD} --fp8-interval ${FP8_MEASURE_INTERVAL}"
     CMD="${CMD} --fp8-margin ${FP8_MARGIN}"
     CMD="${CMD} --fp8-amax-compute-algo ${FP8_AMAX_COMPUTE_ALGO}"
     CMD="${CMD} --fp8-amax-history-len ${FP8_AMAX_HISTORY_LEN}"
     CMD="${CMD} --fp8-format ${FP8_FORMAT}"
-    CMD="${CMD} --transformer-impl ${TRANSFORMER_IMPL}"
+    CMD="${CMD} --fp8-coverage ${FP8_COVERAGE}"
 
-    if [[ "${HL_FP8_AMAX_REDUCE}" -eq 1 ]]; then
+    if [[ "${FP8_AMAX_REDUCE}" -eq 1 ]]; then
         CMD="${CMD} --fp8-amax-reduce"
     fi
 fi

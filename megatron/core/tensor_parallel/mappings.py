@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import torch
@@ -11,12 +11,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.utils import is_lazy_mode, is_real_cuda_device_available
-
-try:
-    import habana_frameworks.torch.core as htcore
-except:
-    pass
+from megatron.core.utils import call_mark_step
 
 from .utils import split_tensor_along_last_dim
 
@@ -24,18 +19,9 @@ from .utils import split_tensor_along_last_dim
 def _reduce(input_):
     """All-reduce the input tensor across model parallel group."""
 
-    from megatron.training import get_args
-
-    try:
-        args = get_args()
-    except:
-        args = None
-    fp8_4k_case = args is not None and args.fp8 is not None and args.seq_length == 4096
-
     # Bypass the function if we are using only 1 GPU.
     if get_tensor_model_parallel_world_size() == 1:
-        if not is_real_cuda_device_available() and is_lazy_mode() and not fp8_4k_case:
-            htcore.mark_step()
+        call_mark_step()
         return input_
 
     # All-reduce.
@@ -125,8 +111,11 @@ def _gather_along_first_dim(input_, output_split_sizes=None):
     """Gather tensors and concatenate along the first dimension.
 
     Args:
-        input_tensor (torch.Tensor): A tensor to be gathered.
-        output_split_sizes (List[int], optional): A list specifying the sizes of the output splits along the first dimension. If None, equal splitting is assumed. Default: None.
+        input_tensor (torch.Tensor):
+            A tensor to be gathered.
+        output_split_sizes (List[int], optional):
+            A list specifying the sizes of the output splits along the first dimension.
+            If None, equal splitting is assumed. Default: None.
 
     Returns:
         torch.Tensor: Gathered tensor.
@@ -595,10 +584,13 @@ def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
 
 def all_to_all_sp2hp(input_):
     """
-    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape [num_tokens/TP, H] to [num_tokens, H/TP].
+    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape
+    [num_tokens/TP, H] to [num_tokens, H/TP].
 
     Args:
-        input_ (torch.Tensor): The input tensor which has been distributed along the sequence dimension.
+        input_ (torch.Tensor):
+            The input tensor which has been distributed along the sequence
+            dimension.
 
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens, H/TP].
@@ -617,10 +609,13 @@ def all_to_all_sp2hp(input_):
 
 def all_to_all_hp2sp(input_):
     """
-    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape [num_tokens, H/TP] to [num_tokens/TP, H].
+    Perform AlltoAll communication on tensor parallel group, transform the input tensor from shape
+    [num_tokens, H/TP] to [num_tokens/TP, H].
 
     Args:
-        input_ (torch.Tensor): The input tensor which has been distributed along the hidden dimension.
+        input_ (torch.Tensor):
+            The input tensor which has been distributed along the hidden
+            dimension.
 
     Returns:
         torch.Tensor: The output tensor with shape [num_tokens/TP, H].

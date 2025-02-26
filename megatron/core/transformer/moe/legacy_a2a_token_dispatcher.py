@@ -1,3 +1,4 @@
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from typing import List, Optional, Tuple
@@ -51,6 +52,7 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
         self.router_topk = config.moe_router_topk
         self.add_bias = config.add_bias_linear
         self.ep_size = config.expert_model_parallel_size
+        self.deterministic_mode = config.deterministic_mode
         self.probs = None
         self.input_splits = None
         self.output_splits = None
@@ -83,9 +85,14 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
         Returns:
             torch.Tensor: Tensor containing the number of tokens assigned to local expert.
         """
-        num_local_tokens_per_expert = torch.histc(
-            indices, bins=self.num_experts, min=0, max=self.num_experts
-        )
+        if self.deterministic_mode:
+            num_local_tokens_per_expert = torch.bincount(
+                indices.view(-1), minlength=self.num_experts
+            )
+        else:
+            num_local_tokens_per_expert = torch.histc(
+                indices, bins=self.num_experts, min=0, max=self.num_experts
+            )
         # num_local_tokens_per_expert: [num_experts]
 
         ep_size = self.config.expert_model_parallel_size

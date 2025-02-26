@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Specs for Retro decoder."""
@@ -27,7 +27,7 @@ from megatron.core.transformer.transformer_block import (
 )
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -42,7 +42,7 @@ except ImportError:
     LNImpl = WrappedTorchLayerNorm
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
         TENorm,
@@ -54,7 +54,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
+    from megatron.core.extensions.intel_transformer_engine import (
         IntelTEColumnParallelLinear,
         IntelTEDotProductAttention,
         IntelTENorm,
@@ -76,7 +76,8 @@ def get_retro_decoder_layer_te_spec(
     provided for the first Retro decoder layer.
 
     Args:
-        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
+        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for
+            the first Retro decoder layer.
 
     Returns:
         A module spec with Transformer Engine modules.
@@ -90,10 +91,8 @@ def get_retro_decoder_layer_te_spec(
         normalization_class = TENorm
     else:
         enable_fsdpa = False
-        try:
-            from intel_transformer_engine.utils import is_gaudi3
-        except:
-            from habana_transformer_engine.utils import is_gaudi3
+        from intel_transformer_engine.utils import is_gaudi3
+
         if is_gaudi3() and enable_fsdpa:
             core_attention_class = IntelTEDotProductAttention
         elif enable_fsdpa:
@@ -107,9 +106,7 @@ def get_retro_decoder_layer_te_spec(
     spec.submodules.pre_cross_attn_layernorm = normalization_class
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={
-            "encoder_block_spec": encoder_block_spec,
-        },
+        params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
             linear_q=linear_q,
             linear_kv=linear_kv,
@@ -133,7 +130,8 @@ def get_retro_decoder_layer_local_spec(
     provided for the first Retro decoder layer.
 
     Args:
-        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided for the first Retro decoder layer.
+        encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided
+            for the first Retro decoder layer.
 
     Returns:
         A module spec with local modules.
@@ -142,9 +140,7 @@ def get_retro_decoder_layer_local_spec(
     spec.submodules.pre_cross_attn_layernorm = LNImpl
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={
-            "encoder_block_spec": encoder_block_spec,
-        },
+        params={"encoder_block_spec": encoder_block_spec},
         submodules=CrossAttentionSubmodules(
             linear_q=ColumnParallelLinear,
             linear_kv=ColumnParallelLinear,
@@ -162,9 +158,12 @@ def get_retro_decoder_block_spec(
     """Retro decoder block spec.
 
     Retro decoder block implementation details:
-    - The retro decoder block consists of interleaved GPT layers and customized Retro decoder layers.
-    - The Retro decoder layers are spaced three layers apart, and start on layer 6 or 9 (depending on the total number of layers).
-    - The first decoder layer instantiates an encoder block, and it therefore passes in an encoder_block_spec.
+    - The retro decoder block consists of interleaved GPT layers
+        and customized Retro decoder layers.
+    - The Retro decoder layers are spaced three layers apart,
+        and start on layer 6 or 9 (depending on the total number of layers).
+    - The first decoder layer instantiates an encoder block,
+        and it therefore passes in an encoder_block_spec.
 
     Args:
         config (RetroConfig): Retro config.

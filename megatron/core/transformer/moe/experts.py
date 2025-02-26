@@ -1,8 +1,9 @@
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import math
 from copy import deepcopy
 from functools import partial
+from math import ceil
 from typing import Optional, Tuple
 
 import torch
@@ -35,10 +36,9 @@ from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
 
 
 class GroupedMLP(MegatronModule):
-    """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
+    """An efficient implementation of the Experts layer using GroupedGEMM.
 
-    This class is designed to execute multiple experts in parallel, thereby maximizing
-    computational efficiency.
+    Executes multiple experts in parallel to maximize computational efficiency.
     """
 
     def __init__(self, num_local_experts: int, config: TransformerConfig):
@@ -48,8 +48,7 @@ class GroupedMLP(MegatronModule):
         gg.assert_grouped_gemm_is_available()
         assert (
             config.add_bias_linear == False
-        ), "bias in the expert layer is not supported in Grouped GEMM yet, please set \
-        '--disable-bias-linear' instead."
+        ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
@@ -78,7 +77,6 @@ class GroupedMLP(MegatronModule):
             # see https://arxiv.org/pdf/2002.05202.pdf
             fc1_output_size *= 2
         fc1_output_size_per_partition = divide(fc1_output_size, tp_size)
-
         fc2_input_size = self.config.ffn_hidden_size * self.num_local_experts
         fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
 
@@ -97,9 +95,7 @@ class GroupedMLP(MegatronModule):
             )
             self.weight2 = Parameter(
                 torch.empty(
-                    fc2_input_size_per_partition,
-                    self.config.hidden_size,
-                    dtype=config.params_dtype,
+                    fc2_input_size_per_partition, self.config.hidden_size, dtype=config.params_dtype
                 )
             )
             if config.perform_initialization:
@@ -151,6 +147,7 @@ class GroupedMLP(MegatronModule):
                     partition_dim=0,
                     expert_parallel=self.expert_parallel,
                 )
+
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
 
@@ -166,7 +163,7 @@ class GroupedMLP(MegatronModule):
 
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
-    def forward(self, permuted_local_hidden_states, tokens_per_expert):
+    def forward(self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor):
         """Forward step of the GroupedMLP."""
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
@@ -184,8 +181,7 @@ class GroupedMLP(MegatronModule):
             # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0
 
-            # Make sure parameters still have gradients when no tokens are routed to this set of
-            # experts.
+            # Make sure params of experts still have gradients even given zero tokens.
             w1 = self.weight1.view(self.config.hidden_size, -1)
             w2 = self.weight2.view(-1, self.config.hidden_size)
             h = torch.matmul(permuted_local_hidden_states, w1)
@@ -350,8 +346,7 @@ class GroupedMLP(MegatronModule):
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
-    This class is designed to execute multiple experts in parallel, thereby maximizing
-    computational efficiency.
+    Executes multiple experts in parallel to maximize computational efficiency.
     """
 
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
@@ -360,8 +355,7 @@ class TEGroupedMLP(MegatronModule):
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
 
-        # If this is a gated linear unit we double the output width, see
-        # https://arxiv.org/pdf/2002.05202.pdf
+        # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
@@ -512,7 +506,7 @@ class SequentialMLP(MegatronModule):
         """Padding tensor shape to multiples of 16."""
         actual_num_tokens = hidden.shape[0]
         divisor = 16
-        padded_num_tokens = math.ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
+        padded_num_tokens = ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
         if padded_num_tokens > 0:
             pad_tensor = torch.zeros(
                 padded_num_tokens, hidden.shape[1], dtype=hidden.dtype, device=hidden.device
@@ -601,3 +595,136 @@ class SequentialMLP(MegatronModule):
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
+
+
+class IntelDynamicMLP(MegatronModule):
+    """An efficient implementation of the Experts layer using Synapse Fused MoE kernel.
+
+    This class is designed to execute multiple experts in parallel, thereby maximizing computational efficiency. It can process expert FFN with 2 (default) or 3 separate weight tensors and different activation functions: silu, gelu, relu.
+    """
+
+    def __init__(self, num_local_experts: int, config: TransformerConfig):
+        super().__init__(config=config)
+
+        self.config: TransformerConfig = config
+        self.num_local_experts = num_local_experts
+        assert (
+            config.add_bias_linear == False
+        ), "bias in the expert layer is not supported in IntelDynamicMLP yet, please set '--disable-bias-linear' instead."
+
+        self.expert_parallel = config.expert_model_parallel_size > 1
+        assert not self.expert_parallel, "EP is not supported in IntelDynamicMLP yet."
+        self.moe_extended_tp = config.moe_extended_tp
+        assert not self.moe_extended_tp, "moe_extended_tp is not supported in IntelDynamicMLP yet."
+        assert not self.config.fp8, "FP8 is not supported in IntelDynamicMLP yet."
+
+        self.permuted_weights = config.moe_permuted_weights  # HPU default is True
+        self.fused_weights = config.moe_fused_weights  # HPU default is True
+
+        # All are GLU activations
+        if self.config.activation_func == F.silu:
+            self.activation_fn = 'silu'
+        elif self.config.activation_func == F.relu:
+            self.activation_fn = 'relu'
+        elif self.config.activation_func == F.gelu:
+            self.activation_fn = 'gelu'
+        else:
+            raise ValueError(
+                f"IntelDynamicMLP activation function supported: ['silu', 'gelu', 'relu'], got: {self.config.activation_func}"
+            )
+
+        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        fc1_output_size = self.config.ffn_hidden_size * self.num_local_experts
+        fc2_input_size = self.config.ffn_hidden_size * self.num_local_experts
+        fc1_output_size *= 2
+
+        fc1_output_size_per_partition = divide(fc1_output_size, self.tp_size)
+        fc2_input_size_per_partition = divide(fc2_input_size, self.tp_size)
+        fc1_output_size_per_partition_per_expert = divide(
+            fc1_output_size_per_partition, self.num_local_experts
+        )
+        fc2_input_size_per_partition_per_expert = divide(
+            fc2_input_size_per_partition, self.num_local_experts
+        )
+        expert_range = range(self.num_local_experts)
+        if self.fused_weights:  # default
+            w1_shape = (fc1_output_size_per_partition_per_expert, config.hidden_size)
+            w2_shape = (config.hidden_size, fc2_input_size_per_partition_per_expert)
+            dim1, dim2 = 0, 1
+            if not self.permuted_weights:
+                w1_shape = (w1_shape[1], w1_shape[0])
+                w2_shape = (w2_shape[1], w2_shape[0])
+                dim1, dim2 = 1, 0
+            w1 = [self.initialize_moe_weight(shape=w1_shape, dim=dim1) for _ in expert_range]
+            w2 = [self.initialize_moe_weight(shape=w2_shape, dim=dim2) for _ in expert_range]
+            self.expert_weights = (w1, w2)
+        else:
+            ffn_hidden_size_per_partition = divide(self.config.ffn_hidden_size, self.tp_size)
+            w1_shape = (ffn_hidden_size_per_partition, config.hidden_size)
+            w2_shape = (config.hidden_size, fc2_input_size_per_partition_per_expert)
+            dim1, dim2 = 0, 1
+            if not self.permuted_weights:
+                w1_shape = (w1_shape[1], w1_shape[0])
+                w2_shape = (w2_shape[1], w2_shape[0])
+                dim1, dim2 = 1, 0
+            w11 = [self.initialize_moe_weight(shape=w1_shape, dim=dim1) for _ in expert_range]
+            w12 = [self.initialize_moe_weight(shape=w1_shape, dim=dim1) for _ in expert_range]
+            w2 = [self.initialize_moe_weight(shape=w2_shape, dim=dim2) for _ in expert_range]
+            self.expert_weights = (w11, w12, w2)
+
+    def forward(self, hidden_states: torch.Tensor, probs: torch.Tensor, indices: torch.Tensor):
+        original_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+
+        fc2_output = torch.ops.hpu.mixture_of_experts(
+            hidden_states,
+            indices,
+            probs,
+            *self.expert_weights,
+            permuted_weights=self.permuted_weights,
+            activation=self.activation_fn,
+            experts_min=0,
+            experts_max=self.num_local_experts - 1,
+            recomp=self.config.moe_layer_recompute,
+        )
+
+        output = fc2_output.view(original_shape)
+
+        return output, None
+
+    def initialize_moe_weight(self, shape: Tuple, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        device = (
+            torch.device('cpu')
+            if self.config.use_cpu_initialization
+            else torch.cuda.current_device()
+        )
+
+        weight = Parameter(torch.empty(*shape, device=device, dtype=self.config.params_dtype))
+        if self.config.perform_initialization:
+            if self.config.use_cpu_initialization:
+                if dim == 0:
+                    cpu_shape = (shape[0] * self.tp_size, self.config.hidden_size, shape[0])
+                elif dim == 1:
+                    cpu_shape = (self.config.hidden_size, shape[1] * self.tp_size, shape[1])
+                else:
+                    raise ValueError(f"Wrong partition dimension {dim} not in (0,1)")
+
+                _initialize_affine_weight_cpu(
+                    weight,
+                    *cpu_shape,
+                    partition_dim=dim,
+                    init_method=self.config.init_method,
+                    params_dtype=self.config.params_dtype,
+                )
+                weight = weight.to(torch.cuda.current_device())
+            else:
+                _initialize_affine_weight_gpu(
+                    weight,
+                    self.config.init_method,
+                    partition_dim=dim,
+                    expert_parallel=self.expert_parallel,
+                )
+        setattr(weight, 'allreduce', not self.expert_parallel)
+
+        return weight

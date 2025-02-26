@@ -1,3 +1,5 @@
+# Copyright (C) 2025 Intel Corporation
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import logging
 from typing import Optional, Tuple
 
@@ -21,6 +23,8 @@ class LanguageModule(MegatronModule):
 
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config=config)
+        if config.tensor_model_parallel_size == 1:
+            self.criterion = torch.nn.CrossEntropyLoss(reduction='none')
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
@@ -32,15 +36,24 @@ class LanguageModule(MegatronModule):
         Returns:
             Tensor: Loss tensor of dimensions [batch size, sequence_length]
         """
-        # [b s] => [s b]
-        labels = labels.transpose(0, 1).contiguous()
-        if self.config.cross_entropy_loss_fusion:
-            loss = fused_vocab_parallel_cross_entropy(logits, labels)
+        if self.config.tensor_model_parallel_size == 1:
+            logits_in = logits.permute(1, 0, 2).contiguous()
+            # Reshape logits and labels for CrossEntropyLoss
+            # logits: [batch_size * sequence_length, vocab_size]
+            # labels: [batch_size * sequence_length]
+            loss = self.criterion(logits_in.view(-1, logits_in.size(-1)).float(), labels.view(-1))
+            # [s x b] => [b, s]
+            loss = loss.view(labels.size(0), -1)
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+            # [b s] => [s b]
+            labels = labels.transpose(0, 1).contiguous()
+            if self.config.cross_entropy_loss_fusion:
+                loss = fused_vocab_parallel_cross_entropy(logits, labels)
+            else:
+                loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 
-        # [s b] => [b, s]
-        loss = loss.transpose(0, 1).contiguous()
+            # [s b] => [b, s]
+            loss = loss.transpose(0, 1).contiguous()
         return loss
 
     def setup_embeddings_and_output_layer(self) -> None:
@@ -60,15 +73,14 @@ class LanguageModule(MegatronModule):
         if not self.share_embeddings_and_output_weights:
             return
 
-        if self.pre_process and self.post_process:
+        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
             # Zero out wgrad if sharing embeddings between two layers on same
             # pipeline stage to make sure grad accumulation into main_grad is
             # correct and does not include garbage values (e.g., from torch.empty).
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 
-        if self.pre_process and not self.post_process:
-            assert parallel_state.is_pipeline_first_stage()
+        if parallel_state.is_pipeline_first_stage() and self.pre_process and not self.post_process:
             self.shared_embedding_or_output_weight().shared_embedding = True
 
         if self.post_process and not self.pre_process:
@@ -130,7 +142,7 @@ class LanguageModule(MegatronModule):
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        """ Sharded state dict implementation that handles the output layer weights tying.
+        """Sharded state dict implementation that handles the output layer weights tying.
 
         Args:
             prefix (str): Module name prefix.

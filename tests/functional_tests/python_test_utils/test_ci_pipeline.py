@@ -1,6 +1,5 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 
-import json
 import os
 from typing import List, Union
 
@@ -8,8 +7,6 @@ import numpy as np
 import pytest
 
 from .common import (
-    ALLOW_NONDETERMINISTIC,
-    LOGS_DIR,
     METRIC_TO_THRESHOLD,
     TYPE_OF_TEST_TO_METRIC,
     TypeOfTest,
@@ -25,7 +22,8 @@ def expected_data(request):
 
 # If we require a variation of tests for any of the other pipelines we can just inherit this class.
 class TestCIPipeline:
-    allow_nondeterministic = ALLOW_NONDETERMINISTIC
+    allow_nondeterministic = bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")))
+    logs_dir = os.getenv("LOGS_DIR")
 
     # Replace symbol in namespace to fix function call result for lifetime of
     # this class.
@@ -35,16 +33,16 @@ class TestCIPipeline:
         print(f"The list of expected values: {expected_list} for metric {metric_type}")
 
         try:
-            actual_list = read_tb_logs_as_list(LOGS_DIR)[metric_type]
+            actual_list = read_tb_logs_as_list(self.logs_dir)[metric_type]
         except KeyError as e:
             raise KeyError(
-                f"Required metric {metric_type} not found in TB logs. Please make sure your model exports this metric as its required by the test case/golden values file"
+                f"Required metric {metric_type} not found in TB logs. Please make sure your model \
+exports this metric as its required by the test case/golden values file"
             ) from e
 
         if actual_list is None:
             raise ValueError(f"No values of {metric_type} found in TB logs.")
-        
-        
+
         actual_list_sliced = actual_list[
             metric_dict["start_step"] : metric_dict["end_step"] : metric_dict["step_interval"]
         ]
@@ -53,8 +51,8 @@ class TestCIPipeline:
         if metric_type == "iteration-time":
             actual_list_sliced = actual_list_sliced[3:]
             expected_list = expected_list[3:]
-            print(f"Removing first items of values for metric_type iteration-time")
-        
+            print("Removing first items of values for metric_type iteration-time")
+
         if test_type == TypeOfTest.DETERMINISTIC:
             assert np.allclose(
                 actual_list_sliced, expected_list, rtol=0, atol=0
@@ -86,7 +84,7 @@ class TestCIPipeline:
             if not expected_values['values']:
                 pytest.skip(reason="skipping test as EXPECTED_METRICS_FILE is not set.")
             print(f"Skipping metric {expected_metric} for deterministic as it is approximate only.")
-            
+
     # # @TODO: This is inactive, do we want to activate it?
     # def iteration_timing_node(self):
     #     expected_iteration_timing_avg = self.expected["train_step_timing_avg"]
@@ -96,8 +94,9 @@ class TestCIPipeline:
     #     assert (
     #         expected_iteration_timing_avg
     #         == pytest.approx(expected=iteration_time_avg, rel=self.margin_time)
-    #     ), f"The time per global step must be approximately {expected_iteration_timing_avg} but it is {iteration_time_avg}."
+    #     ), f"The time per global step must be approximately {expected_iteration_timing_avg} but "
+    #         "it is {iteration_time_avg}."
+
 
 # if deterministic, then also approx
 # if not determinstic, then also aprox
-

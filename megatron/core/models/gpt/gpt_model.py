@@ -1,41 +1,59 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import logging
-from typing import Dict, Literal, Optional, Tuple, Union
+from collections import OrderedDict
+from typing import Dict, Literal, Optional
 
-import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import InferenceParams, tensor_parallel
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.enums import AttnMaskType, ModelType
+from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
 
     Args:
-        config (TransformerConfig): Transformer config
-        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
-        vocab_size (int): Vocabulary size
-        max_sequence_length (int): maximum size of sequence. This is used for positional embedding
-        pre_process (bool, optional): Include embedding layer (used with pipeline parallelism). Defaults to True.
-        post_process (bool, optional): Include an output layer (used with pipeline parallelism). Defaults to True.
-        fp16_lm_cross_entropy (bool, optional): Defaults to False.
-        parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor parallel ranks. Defaults to True.
-        share_embeddings_and_output_weights (bool, optional): When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope], optional):  Position embedding type.. Defaults to 'learned_absolute'.
-        rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
-        rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 10000.
-        seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.
+        config (TransformerConfig):
+            Transformer config
+        transformer_layer_spec (ModuleSpec):
+            Specifies module to use for transformer layers
+        vocab_size (int):
+            Vocabulary size
+        max_sequence_length (int):
+            maximum size of sequence. This is used for positional embedding
+        pre_process (bool, optional):
+            Include embedding layer (used with pipeline parallelism). Defaults to True.
+        post_process (bool, optional):
+            Include an output layer (used with pipeline parallelism). Defaults to True.
+        fp16_lm_cross_entropy (bool, optional):
+            Defaults to False.
+        parallel_output (bool, optional):
+            Do not gather the outputs, keep them split across tensor
+            parallel ranks. Defaults to True.
+        share_embeddings_and_output_weights (bool, optional):
+            When True, input embeddings and output logit weights are shared. Defaults to False.
+        position_embedding_type (Literal[learned_absolute,rope], optional):
+            Position embedding type.. Defaults to 'learned_absolute'.
+        rotary_percent (float, optional):
+            Percent of rotary dimension to use for rotary position embeddings.
+            Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
+        rotary_base (int, optional):
+            Base period for rotary position embeddings. Ignored unless
+            position_embedding_type is 'rope'.
+            Defaults to 10000.
+        seq_len_interpolation_factor (Optional[float], optional):
+            scale of linearly interpolating RoPE for longer sequences.
+            The value must be a float larger than 1.0. Defaults to None.
     """
 
     def __init__(
@@ -55,6 +73,9 @@ class GPTModel(LanguageModule):
         seq_len_interpolation_factor: Optional[float] = None,
     ) -> None:
         super().__init__(config=config)
+
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
@@ -108,8 +129,9 @@ class GPTModel(LanguageModule):
                 # all the micro-batches of a global batch for the last pipeline stage. Once we are
                 # done with all the back props for all the microbatches for the last pipeline stage,
                 # it will be in the pipeline flush stage. During this pipeline flush we use the
-                # input activations stored in embedding activation buffer and gradient outputs stored
-                # in gradient buffer to calculate the weight gradients for the embedding final linear layer.
+                # input activations stored in embedding activation buffer and gradient outputs
+                # stored in gradient buffer to calculate the weight gradients for the embedding
+                # final linear layer.
                 self.embedding_activation_buffer = []
                 self.grad_output_buffer = []
             else:
@@ -132,6 +154,11 @@ class GPTModel(LanguageModule):
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
+
+        if has_config_logger_enabled(self.config):
+            log_config_to_disk(
+                self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
+            )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -206,6 +233,18 @@ class GPTModel(LanguageModule):
             output_weight = self.shared_embedding_or_output_weight()
         logits, _ = self.output_layer(hidden_states, weight=output_weight)
 
+        if has_config_logger_enabled(self.config):
+            payload = OrderedDict(
+                {
+                    'input_ids': input_ids,
+                    'position_ids': position_ids,
+                    'attention_mask': attention_mask,
+                    'decoder_input': decoder_input,
+                    'logits': logits,
+                }
+            )
+            log_config_to_disk(self.config, payload, prefix='input_and_logits')
+
         if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
@@ -217,7 +256,8 @@ class GPTModel(LanguageModule):
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
     ) -> ShardedStateDict:
-        """Sharded state dict implementation for GPTModel backward-compatibility (removing extra state).
+        """Sharded state dict implementation for GPTModel backward-compatibility
+        (removing extra state).
 
         Args:
             prefix (str): Module name prefix.
@@ -230,11 +270,83 @@ class GPTModel(LanguageModule):
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
 
-        # Old GPT checkpoints only stored the output layer weight key. So we remove the _extra_state key
-        # but check that it doesn't contain any data anyway
+        # Old GPT checkpoints only stored the output layer weight key. So we remove the
+        # _extra_state key but check that it doesn't contain any data anyway
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
         assert not (
             output_extra_state and output_extra_state.data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Customized load."""
+
+        if self.config.moe_capacity_bins_num > 0:
+            capacity_bins_buffers = [
+                buff[0] for buff in self.named_buffers() if 'capacity_bins' in buff[0]
+            ]
+
+            capacity_bins_checkpoint_keys = [
+                key for key in state_dict.keys() if 'capacity_bins' in key
+            ]
+            capacity_bins_key = next(
+                (
+                    key
+                    for key in capacity_bins_checkpoint_keys
+                    if 'capacity_bins.capacity_bins' in key
+                ),
+                None,
+            )
+
+            if capacity_bins_key == None:
+                logging.getLogger(__name__).warning(
+                    'WARNING: Missing capacity ' 'bins data in the checkpoint.'
+                )
+                strict = False
+
+            elif torch.numel(state_dict[capacity_bins_key]) != self.config.moe_capacity_bins_num:
+                # When number of capacity bins differs from that in the
+                # checkpoint, do not use the checkpoint's capacity bins values;
+                # instead, generate new ones from scratch.
+                logging.getLogger(__name__).warning(
+                    'WARNING: Number of '
+                    'capacity bins: {} differs from that in the checkpoint: {}. '
+                    'Their values and stats are going to be generated from '
+                    'scratch.'.format(
+                        self.config.moe_capacity_bins_num, state_dict[capacity_bins_key]
+                    )
+                )
+
+                for key in capacity_bins_checkpoint_keys:
+                    del state_dict[key]
+                    strict = False
+
+            else:
+                unexpected_keys = [
+                    key
+                    for key in capacity_bins_checkpoint_keys
+                    if not any(buff in key for buff in capacity_bins_buffers)
+                ]
+                missing_buffers = [
+                    buff
+                    for buff in capacity_bins_buffers
+                    if not any(buff in key for key in capacity_bins_checkpoint_keys)
+                ]
+
+                # Reset capacity bins stats when some of them are missing or unexpected.
+                if missing_buffers or unexpected_keys:
+                    logging.getLogger(__name__).warning(
+                        'WARNING: There are '
+                        'missing: {} or unexpected: {} capacity bins stats. The '
+                        'capacity bins stats are going to be '
+                        'reset.'.format(missing_buffers, unexpected_keys)
+                    )
+
+                    for key in capacity_bins_checkpoint_keys:
+                        if 'capacity_bins.capacity_bins' in key:
+                            continue
+                        del state_dict[key]
+                        strict = False
+
+        super().load_state_dict(state_dict, strict=strict)

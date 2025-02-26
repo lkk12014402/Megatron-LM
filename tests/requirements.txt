@@ -1,4 +1,6 @@
+einops
 flask-restful
+junitparser
 numpy==1.23.5
 pytest
 pytest-cov

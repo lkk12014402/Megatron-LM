@@ -11,7 +11,7 @@ Before you get started, make sure to review the [Supported Configurations](#supp
 * [Known Issues](#known-issues)
 
 # Megatron Overview
-This implementation is based on https://github.com/NVIDIA/Megatron-LM at core_r0.8.0.
+This implementation is based on https://github.com/NVIDIA/Megatron-LM at core_r0.9.0.
 
 This repository comprises two essential components: Megatron-LM and Megatron-Core. Megatron-LM serves as a research-oriented framework leveraging Megatron-Core for large language model (LLM) training. Megatron-Core, on the other hand, is a library of optimized training techniques including versioned APIs and regular releases. Alternatively, you can integrate Megatron-Core's building blocks into your preferred training framework.
 
@@ -78,25 +78,30 @@ export PYTHONPATH=$MEGATRON_LM_ROOT:$PYTHONPATH
 # Supported Configurations
 | Model                                       | Mode        | Intel Gaudi software Version | PyTorch Version | Validated on Gaudi 2 | Validated on Gaudi 3 |
 | --------------------------------------------| ----------- | ---------------------------- | --------------- | -------------------- | -------------------- |
-| [LLaMA 3.1](examples/llama/README.md)       | Pretraining | 1.19.0                       | 2.5.1           | :heavy_check_mark:   | :heavy_check_mark:*  |
-| [Mixtral 8x7B](examples/mixtral/README.md)  | Pretraining | 1.19.0                       | 2.5.1           | :heavy_check_mark:** |                      |
+| [LLaMA 3.1](examples/llama/README.md)       | Pretraining | 1.20.0                       | 2.6.0           | :heavy_check_mark:   | :heavy_check_mark:*  |
+| [Mixtral 8x7B](examples/mixtral/README.md)  | Pretraining | 1.20.0                       | 2.6.0           | :heavy_check_mark:** |                      |
 
 *Sporadic numerical instability can occur when training with fp8 precision.
 
 **Only BF16 configurations are currently enabled.
 
 # Changelog
+## 1.20.0
+- Changed the default behavior of "accumulate_allreduce_grads_in_fp32" for the bfloat16 data type. Instead of performing gradient accumulation and all-reduce in fp32, it is sufficient to do so in bfloat16 for some configurations. However, for configurations where Gradient Accumulutation Steps * data parallel size > 256, switching to fp32 is necessary.
+- Rebased code to upstream [core_r0.9.0](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.9.0) release.
+
 ## 1.19.0
  - Added support for Gaudi 3.
  - Added LLaMA 3.1 support and set as default.
- - Added Megatron-LM to Hugging Face LLaMA checkpoint conversion support. Usage example is available [here](./tools/checkpoint/README.md#llama-convert-megatron-lm-to-hugging-face-checkpoint).
- - Added Hugging Face to Megatron-LM LLaMA checkpoint conversion support. Usage example is available [here](./tools/checkpoint/README.md#llama-convert-hugging-face-checkpoint-to-megatron-lm).
+ - Added Megatron-LM to Hugging Face LLaMA and Mixtral checkpoint conversion support. Usage example is available [here](./tools/checkpoint/README.md#llama-convert-megatron-lm-to-hugging-face-checkpoint).
+ - Added Hugging Face to Megatron-LM LLaMA and Mixtral checkpoint conversion support. Usage example is available [here](./tools/checkpoint/README.md#llama-convert-hugging-face-checkpoint-to-megatron-lm).
  - Added Mixtral 8x7b BF16 support (preview version) [here](./examples/mixtral/README.md).
+
 ## 1.18.0
  - Initial release.
 
 ### Script Modifications
-Major changes done to the original code from [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.8.0) repository:
+Major changes done to the original code from [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM/tree/core_r0.9.0) repository:
 * Changed README file content.
 * Added HPU support.
 * Added local RMSNorm support.
@@ -107,3 +112,4 @@ Major changes done to the original code from [NVIDIA/Megatron-LM](https://github
 
 # Known Issues
 * Only recipes mentioned in this README are supported and verified.
+* Gaudi 3 scale out configurations can exhibit performance fluctuations.

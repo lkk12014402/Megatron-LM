@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
 
@@ -12,6 +12,8 @@ except:
 import os
 import torch
 from functools import partial
+from contextlib import nullcontext
+import inspect
 
 from typing import Union
 from megatron.training import get_args
@@ -30,6 +32,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.core.utils import StragglerDetector
 from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.transformer_config import set_cag_dtype_cast_wa
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -40,7 +43,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-
 
 stimer = StragglerDetector()
 
@@ -63,6 +65,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         torch.use_deterministic_algorithms(True)
 
     print_rank_0('building GPT model ...')
+
+    set_cag_dtype_cast_wa(args.use_torch_compiled_autograd)
+
     # Experimental loading arguments from yaml
     if args.yaml_cfg is not None:
         config = core_transformer_config_from_yaml(args, "language_model")
@@ -88,8 +93,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                                                             args.num_experts,
                                                             args.moe_grouped_gemm,
                                                             args.qk_layernorm,
+                                                            args.fp8,
                                                             enable_fused_sdpa,
-                                                            args.fp8_coverage)
+                                                            args.fp8_coverage,
+                                                            args.context_parallel_size)
             else:
                 use_pre_norm = not args.apply_norm_post_sub_block
                 transformer_layer_spec = get_gpt_layer_local_spec(
@@ -100,20 +107,36 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                                                             enable_fused_sdpa,
                                                             use_pre_norm)
 
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=True,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base
-        )
+        build_model_context = nullcontext
+        build_model_context_args = {}
+        if args.fp8_param_gather:
+            try:
+                from transformer_engine.pytorch import fp8_model_init
+
+                build_model_context = fp8_model_init
+                build_model_context_args["enabled"] = True
+
+                # Check if fp8_model_init supports preserve_high_precision_init_val
+                if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
+                    build_model_context_args["preserve_high_precision_init_val"] = True
+            except:
+                raise RuntimeError("--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found.")
+
+        with build_model_context(**build_model_context_args):
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=transformer_layer_spec,
+                vocab_size=args.padded_vocab_size,
+                max_sequence_length=args.max_position_embeddings,
+                pre_process=pre_process,
+                post_process=post_process,
+                fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+                parallel_output=True,
+                share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+                position_embedding_type=args.position_embedding_type,
+                rotary_percent=args.rotary_percent,
+                rotary_base=args.rotary_base
+            )
 
     return model
 
@@ -220,6 +243,7 @@ def core_gpt_dataset_config_from_args(args):
             get_blend_from_list(args.valid_data_path),
             get_blend_from_list(args.test_data_path)
         ],
+        renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,

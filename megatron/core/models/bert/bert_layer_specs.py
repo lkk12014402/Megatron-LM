@@ -1,4 +1,5 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_dot_product_attention import FusedDotProductAttention
@@ -12,7 +13,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
-    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
+    from megatron.core.extensions.intel_transformer_engine import (
         IntelTEColumnParallelLinear,
         IntelTEDotProductAttention,
         IntelTENorm,
@@ -22,7 +23,7 @@ except:
     pass
 
 try:
-    from megatron.core.transformer.custom_layers.transformer_engine import (
+    from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TERowParallelLinear,
@@ -33,7 +34,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -56,10 +57,8 @@ if HAVE_TE:
     linear_qkv = TELayerNormColumnParallelLinear
 else:
     enable_fsdpa = False
-    try:
-        from intel_transformer_engine.utils import is_gaudi3
-    except:
-        from habana_transformer_engine.utils import is_gaudi3
+    from intel_transformer_engine.utils import is_gaudi3
+
     if is_gaudi3() and enable_fsdpa:
         core_attention_class = IntelTEDotProductAttention
     elif enable_fsdpa:
@@ -90,11 +89,7 @@ bert_layer_with_transformer_engine_spec = ModuleSpec(
         self_attn_bda=get_bias_dropout_add,
         pre_mlp_layernorm=IdentityOp if HAVE_TE else IntelTENorm,
         mlp=ModuleSpec(
-            module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=linear_fc1,
-                linear_fc2=linear_fc2,
-            ),
+            module=MLP, submodules=MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
         ),
         mlp_bda=get_bias_dropout_add,
     ),
@@ -120,10 +115,7 @@ bert_layer_local_spec = ModuleSpec(
         pre_mlp_layernorm=LNImpl,
         mlp=ModuleSpec(
             module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=ColumnParallelLinear,
-                linear_fc2=RowParallelLinear,
-            ),
+            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
         ),
         mlp_bda=get_bias_dropout_add,
         sharded_state_dict_keys_map={

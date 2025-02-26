@@ -1,20 +1,17 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import json
 import os
 import sys
 import torch
-from importlib.metadata import version
-from megatron.core.utils import is_real_cuda_device_available
-from pkg_resources import packaging
 
 from setter import ModelSetter
-from utils import get_mcore_transformer_block_key, print_memory_usage
+from utils import get_mcore_transformer_block_key
+from megatron.core.utils import get_te_version, is_real_cuda_device_available, is_te_min_version
 from verify_checkpoint_non_tp_consistency import verify_checkpoint
 
 device = "cpu"
-
 
 class MCoreSetter(ModelSetter):
 
@@ -219,6 +216,11 @@ class MCoreMoETESetter(MCoreSetter):
         model,
         layer_idx,
         router_weight=None,
+        bins_usage = None,
+        total_requested_capacity = None,
+        bins_usage_last = None,
+        total_requested_capacity_last = None,
+        capacity_bins = None,
         self_attn_norm_weight=None,
         self_attn_norm_bias=None,
         self_attn_qkv_weight=None,
@@ -238,7 +240,10 @@ class MCoreMoETESetter(MCoreSetter):
         l = block.layers[layer_idx]
 
         # Self attention.
-        cls.set_tensor(l.self_attention.linear_qkv.layer_norm_weight, self_attn_norm_weight)
+        if is_real_cuda_device_available():
+            cls.set_tensor(l.self_attention.linear_qkv.layer_norm_weight, self_attn_norm_weight)
+        else:
+            cls.set_tensor(l.input_layernorm.weight, self_attn_norm_weight)
         if self_attn_norm_bias is not None:
             cls.set_tensor(l.self_attention.linear_qkv.layer_norm_bias, self_attn_norm_bias)
         cls.set_tensor(l.self_attention.linear_qkv.weight, self_attn_qkv_weight)
@@ -253,7 +258,20 @@ class MCoreMoETESetter(MCoreSetter):
         if model.config.normalization == "LayerNorm":
             cls.set_tensor(l.pre_mlp_layernorm.bias, mlp_norm_bias)
 
+        if model.config.moe_router_fp32:
+            l.mlp.router.to(torch.float32)
         cls.set_tensor(l.mlp.router.weight, router_weight)
+
+        if capacity_bins is not None:
+            cls.set_tensor(l.mlp.router.capacity_bins.capacity_bins, capacity_bins)
+            if bins_usage is not None:
+                cls.set_tensor(l.mlp.router.capacity_bins.bins_usage, bins_usage)
+            if total_requested_capacity is not None:
+                cls.set_tensor(l.mlp.router.capacity_bins.total_requested_capacity, total_requested_capacity)
+            if bins_usage_last is not None:
+                cls.set_tensor(l.mlp.router.capacity_bins.optimize_moe_bins_usage_last, bins_usage_last)
+            if total_requested_capacity_last is not None:
+                cls.set_tensor(l.mlp.router.capacity_bins.optimize_moe_total_requested_capacity_last, total_requested_capacity_last)
 
         num_local_experts = mlp_fc1_weight.shape[0]
         for expert_idx in range(num_local_experts):
@@ -264,7 +282,8 @@ class MCoreMoETESetter(MCoreSetter):
 def get_model_setter(model_type, transformer_impl, num_experts=0):
     if num_experts is not None and num_experts > 0:
         # Only support TE setter for MOE
-        assert transformer_impl == "transformer_engine"
+        if is_real_cuda_device_available():
+            assert transformer_impl == "transformer_engine"
         setter = MCoreMoETESetter
     else:
         setter = {
@@ -307,10 +326,8 @@ def convert_to_json_serializable(o):
 def save_checkpoint(queue, args):
 
     # Transformer engine >= 0.12.0, for CPU initialization.
-    if is_real_cuda_device_available():
-        te_version = packaging.version.Version(version("transformer-engine"))
-        assert te_version >= packaging.version.Version("0.12.0"), \
-            "transformer engine version: %s (>=0.12.0 required)." % te_version
+    assert is_te_min_version("0.12.0") or not is_real_cuda_device_available() , \
+        "transformer engine version: %s (>=0.12.0 required)." % get_te_version()
 
     # Search in directory above this
     sys.path.append(os.path.abspath(
@@ -409,7 +426,8 @@ def save_checkpoint(queue, args):
                 '--no-save-rng',
                 '--no-initialization',
                 '--save-interval', '1',
-                '--save', args.save_dir
+                '--save', args.save_dir,
+                '--ckpt-format', 'torch', # only 'torch' supported for conversion
                 ]
 
     if md.make_vocab_size_divisible_by is not None:
@@ -444,7 +462,9 @@ def save_checkpoint(queue, args):
                         'encoder_num_layers', 'encoder_seq_length',
                         'distribute_saved_activations',
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
-                        'start_weight_decay', 'end_weight_decay']
+                        'start_weight_decay', 'end_weight_decay',
+                        'ckpt_format',
+        ]
 
         for arg, value in vars(md.checkpoint_args).items():
             if arg in args_to_keep:
@@ -459,11 +479,6 @@ def save_checkpoint(queue, args):
     # Explicitly copy sequence_parallel, apply_query_key_layer_scaling.
     margs.sequence_parallel = md.checkpoint_args.sequence_parallel
     margs.apply_query_key_layer_scaling = md.checkpoint_args.apply_query_key_layer_scaling
-
-    # Sequence parallel is required if use both tensor-parallel and Moe.
-    if margs.num_experts is not None and args.target_tensor_parallel_size is not None:
-        if margs.num_experts > 1 and args.target_tensor_parallel_size > 1:
-            margs.sequence_parallel = True
 
     validate_args(margs)
 
@@ -481,16 +496,21 @@ def save_checkpoint(queue, args):
         'use_legacy_models', 'rotary_base', 'add_position_embedding',
         'attention_dropout', 'hidden_dropout', 'weight_decay', 'start_weight_decay',
         'end_weight_decay', 'adam_beta2', 'adam_eps', 'recompute_granularity',
-        'deterministic_mode', 'sequence_parallel', 'lr', 'lr_decay_iters',
-        'lr_decay_style', 'lr_warmup_iters', 'min_lr', 'perform_initialization',
-        'bf16', 'fp16', 'data_parallel_size', 'params_dtype', 'padded_vocab_size',
-        'world_size'
+        'recompute_method', 'recompute_num_layers', 'deterministic_mode',
+        'lr', 'lr_decay_iters', 'lr_decay_style', 'sequence_parallel',
+        'lr_warmup_iters', 'min_lr', 'perform_initialization', 'bf16', 'fp16',
+        'data_parallel_size', 'params_dtype', 'padded_vocab_size', 'world_size'
     ]
 
     # loop over and set margs attribute if md has that attribute
     for attr in margs_attributes:
         if hasattr(md.checkpoint_args, attr):
             setattr(margs, attr, getattr(md.checkpoint_args, attr))
+    
+    # Sequence parallel is required if use both tensor-parallel and Moe.
+    if margs.num_experts is not None and args.target_tensor_parallel_size is not None:
+        if margs.num_experts > 1 and args.target_tensor_parallel_size > 1:
+            margs.sequence_parallel = True
 
     set_global_variables(margs, build_tokenizer=False)
 
@@ -656,9 +676,16 @@ def save_checkpoint(queue, args):
 
             if margs.num_experts:
                 router = msg.pop("router weight")
+            
+            if hasattr(args, "load_capacity_bins") and args.load_capacity_bins:
+                bins_usage = msg.pop("bins usage")
+                total_requested_capacity = msg.pop("total requested capacity")
+                bins_usage_last = msg.pop("bins usage last")
+                total_requested_capacity_last = msg.pop("total requested capacity last")
+                capacity_bins = msg.pop("capacity bins")
 
             # Special handling for swiglu
-            if md.swiglu:
+            if md.swiglu and not margs.num_experts:
                 mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size).to(device)
                 mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size).to(device)
                 mlp_l0_weight = torch.cat((mlp_l0_weight_W, mlp_l0_weight_V), dim=-2)
@@ -669,7 +696,7 @@ def save_checkpoint(queue, args):
                 dense_bias = msg.pop("dense bias")
                 mlp_l1_bias = chunk_bias(msg.pop("mlp l1 bias"), 'row', args.target_tensor_parallel_size, args.target_expert_parallel_size)
                 qkv_bias = chunk_bias(msg.pop("qkv bias"), 'column', args.target_tensor_parallel_size)
-                if md.swiglu:
+                if md.swiglu and not margs.num_experts:
                     mlp_l0_bias_W = chunk_bias(msg.pop("mlp l0 bias W"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
                     mlp_l0_bias_V = chunk_bias(msg.pop("mlp l0 bias V"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
                     mlp_l0_bias = torch.cat((mlp_l0_bias_W, mlp_l0_bias_V), dim=-1)
@@ -718,6 +745,14 @@ def save_checkpoint(queue, args):
                         params_dict.update({
                             "router_weight":  router
                         })
+                    if hasattr(args, "load_capacity_bins") and args.load_capacity_bins:
+                            params_dict.update({
+                                "bins_usage":  bins_usage[pp_rank][ep_rank][tp_rank],
+                                "total_requested_capacity":  total_requested_capacity[pp_rank][ep_rank][tp_rank],
+                                "bins_usage_last":  bins_usage_last[pp_rank][ep_rank][tp_rank],
+                                "total_requested_capacity_last":  total_requested_capacity_last[pp_rank][ep_rank][tp_rank],
+                                "capacity_bins":  capacity_bins[pp_rank][ep_rank][tp_rank],
+                            })
                     model = get_local_model(pp_rank, ep_rank, tp_rank)
                     setter.set_layer(model, layer_id, **params_dict, use_legacy_models=margs.use_legacy_models)
 

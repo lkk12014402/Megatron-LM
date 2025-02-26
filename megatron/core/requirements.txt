@@ -1,5 +1,6 @@
 numpy==1.23.5
-torch
+packaging
 pybind11
+torch
 tensorstore==0.1.45
 zarr

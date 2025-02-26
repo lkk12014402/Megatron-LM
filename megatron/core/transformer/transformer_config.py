@@ -1,22 +1,27 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import types
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
-import torch
 import torch.nn.functional as F
 
 from ..model_parallel_config import ModelParallelConfig
-from ..utils import init_method_normal, scaled_init_method_normal
+from ..utils import (
+    get_te_version,
+    init_method_normal,
+    is_real_cuda_device_available,
+    is_te_min_version,
+    scaled_init_method_normal,
+)
 
 
 @dataclass
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
-    The initialization function has an argument for each parameter, including those in ModelParallelConfig.
+    The initialization function has an argument for each parameter,
+    including those in ModelParallelConfig.
     """
 
     ####################
@@ -24,6 +29,14 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
+
+    first_pipeline_num_layers: int = None
+    """Number of transformer layers on first pipeline stage. 
+    None implies equal layer division across PP ranks."""
+
+    last_pipeline_num_layers: int = None
+    """Number of transformer layers on last pipeline stage. 
+    None implies equal layer division across PP ranks."""
 
     hidden_size: int = 0
     """Transformer hidden size."""
@@ -35,7 +48,8 @@ class TransformerConfig(ModelParallelConfig):
     """Number of query groups for group query attention. If None, normal attention is used."""
 
     ffn_hidden_size: int = None
-    """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size if not provided."""
+    """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size
+    if not provided."""
 
     kv_channels: int = None
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
@@ -82,10 +96,6 @@ class TransformerConfig(ModelParallelConfig):
     activation_func_fp8_input_store: bool = False
     """Store the input of MLP activation function in FP8 for backprop to save memory.
     The stored input is casted back to the original precision before backprop compuatation."""
-
-    num_moe_experts: int = None
-    """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
-    for no MoE."""
 
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
@@ -180,7 +190,6 @@ class TransformerConfig(ModelParallelConfig):
     # activation recomputation
     ####################
     recompute_granularity: str = None
-    recompute_granularity: str = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
     activation checkpointing where only the memory intensive part of attention is checkpointed.
     These memory intensive activations are also less compute intensive which makes activation
@@ -219,7 +228,9 @@ class TransformerConfig(ModelParallelConfig):
     """Margin for the scaling factor computation."""
 
     fp8_interval: int = 1
-    """Controls how often the scaling factor is recomputed."""
+    """DEPRECATED from TransformerEngine v1.8.0. This flag is ignored.
+    Controls how often the scaling factor is recomputed.
+    """
 
     fp8_amax_history_len: int = 1
     """The length of the amax history window used for scaling factor computation."""
@@ -232,7 +243,8 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     fp8_wgrad: bool = True
-    """When set to False, override FP8 config options and do the wgrad computation in higher precision."""
+    """When set to False, override FP8 config options and do the wgrad computation
+    in higher precision."""
 
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
@@ -243,9 +255,31 @@ class TransformerConfig(ModelParallelConfig):
     fp8_amax_reduce: bool = False
     """Sync amax between workers"""
 
+    tp_only_amax_red: bool = False
+    """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
+
+    cache_fp8_weight_fwd: bool = True
+    """When set to True, In forward, calculate fp8 weight only once for the entire batch"""
+
+    cache_fp8_weight: bool = True
+    """When set to True, cache fp8 weight from forward to backward"""
+
     ####################
     # MoE related
     ####################
+    num_moe_experts: int = None
+    """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
+    for no MoE."""
+
+    moe_dynamic_hpu: bool = False
+    """Leverage Gaudi fused Dynamic MoE Kernel to accelerate dropless training."""
+
+    moe_permuted_weights: bool = False
+    """Use fused Dynamic MoE weights to match OptimumHabana/vLLM format."""
+
+    moe_fused_weights: bool = False
+    """Use fused Dynamic MoE weights to match OptimumHabana/vLLM format."""
+
     moe_router_load_balancing_type: str = "aux_loss"
     """Determines the load balancing strategy for the router. "aux_loss" corresponds to the load
     balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing
@@ -255,14 +289,16 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to route to for each token."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax routing for MoE, which means the top-k selection is before the softmax. By default, top-k is done after the softmax."""
+    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
+    By default, softmax is done after top-k."""
+
+    moe_router_fp32: bool = False
+    """Explicit float32 data type conversion for router input tensor for higher precision."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
-    GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
-
-    """
+    GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm)."""
 
     moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended."""
@@ -274,12 +310,12 @@ class TransformerConfig(ModelParallelConfig):
     """Add noise to the input tensor by applying jitter with a specified epsilon value."""
 
     moe_token_dropping: bool = False  # TODO: Support token dropping.
-    """This feature involves selectively dropping and padding tokens for each expert to achieve a
-    specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
-    currently unsupported so should remain False."""
+    """This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is currently unsupported so should remain False."""
 
     moe_token_dispatcher_type: str = "allgather"
-    """The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'."""
+    """The type of token dispatcher to use. The default is 'allgather'.
+    Options are 'allgather' and 'alltoall'."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -298,6 +334,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_capacity_bins_optimize_max_group: int = 4
     """moe_capacity_bins_optimize_max_group (int): Maximum number of experts to be grouped for capacity bins optimization. The default is 4."""
 
+    moe_capacity_bins_max_overhead_factor: float = 0.0
+    """moe_capacity_bins_max_overhead_factor (float): Value of capacity bins overhead, that will trigger bins optimization. Overhead is defined as relative additional capacity used with bins, compared to requested capacity value. The default is 0.0."""
+
     moe_capacity_bins_alignment: int = 64
     """moe_capacity_bins_alignment (int): In case of capacity bins, required bins alignment. The default is 64."""
 
@@ -308,8 +347,8 @@ class TransformerConfig(ModelParallelConfig):
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match the expert capacity length, effective only after the moe_expert_capacity_factor is set. The default setting is False."""
 
     moe_token_drop_policy: str = 'probs'
-    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.
-    """
+    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
+    the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped."""
 
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
@@ -325,11 +364,24 @@ class TransformerConfig(ModelParallelConfig):
     """When set to true, the parameter transposes are not cached for subsequent iterations."""
 
     enable_cuda_graph: bool = False
-    """When set to true, TransformerLayer blocks are wrapped with CUDA graph."""
+    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
+
+    external_cuda_graph: bool = False
+    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+
+    enable_compiled_autograd: bool = False
+    """"When set to true, enable compiled autograd"""
+
+    micro_batch_sync_interval: int = 0
+    """Training CPU-GPU synchronization at micro batch interval, to ensure that CPU is not running too far ahead of GPU."""
+
+    config_logger_dir: str = ""
+    """When non-empty, dumps entry-point configs to config_logger_dir"""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
-        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
+        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
+        details.
         """
         super().__post_init__()
         if self.fp16 and self.bf16:
@@ -362,27 +414,27 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
-            raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
+            raise ValueError('num_moe_experts must be non None to use expert-parallel.')
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
-            raise ValueError(f'num_moe_experts must be non-negative.')
+            raise ValueError('num_moe_experts must be non-negative.')
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_token_dispatcher_type not in ["alltoall", "alltoall_seq"]:
                 raise ValueError(
-                    f'moe_expert_capacity_factor only works with alltoall token dispatcher'
+                    'moe_expert_capacity_factor only works with alltoall token dispatcher'
                 )
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
             if self.moe_router_load_balancing_type not in ["aux_loss", "none"]:
                 raise ValueError(
-                    f'moe_expert_capacity_factor only works with aux_loss or none load balancing'
+                    'moe_expert_capacity_factor only works with aux_loss or none load balancing'
                 )
 
         if self.moe_pad_expert_input_to_capacity:
             if self.moe_expert_capacity_factor is None and self.moe_capacity_bins_num == 0:
                 raise ValueError(
-                    f'moe_expert_capacity_factor or moe_capacity_bins_num > 0 must be set to use moe_pad_expert_input_to_capacity'
+                    'moe_expert_capacity_factor or moe_capacity_bins_num > 0 must be set to use moe_pad_expert_input_to_capacity'
                 )
 
         if self.moe_capacity_bins_num != 0:
@@ -401,51 +453,58 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.cpu_offloading and self.pipeline_model_parallel_size > 1:
             raise ValueError(
-                f'Currently there is no support for Pipeline parallelism with CPU offloading'
+                'Currently there is no support for Pipeline parallelism with CPU offloading'
             )
 
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(
-                f'CPU offloading does not work when activation recomputation is enabled'
+                'CPU offloading does not work when activation recomputation is enabled'
             )
 
         if self.recompute_granularity is not None:
-            if not self.recompute_granularity in ['full', 'selective']:
+            if self.recompute_granularity not in ['full', 'selective']:
                 raise ValueError(
-                    f'When using recompute_granuarlity: {self.recompute_granularity} must be "full" or "selective".'
+                    f'When using recompute_granuarlity: {self.recompute_granularity} must be "full"'
+                    'or "selective".'
                 )
 
             if self.recompute_method is not None:
-                if not self.recompute_method in ['block', 'uniform']:
+                if self.recompute_method not in ['block', 'uniform']:
                     raise ValueError(
                         f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
                     )
             elif self.recompute_granularity != 'selective':
                 raise ValueError(
-                    f'Using recompute_granularity: {self.recompute_granularity} so recompute_method must be "block" or "uniform"'
+                    f'Using recompute_granularity: {self.recompute_granularity} so '
+                    'recompute_method must be "block" or "uniform"'
                 )
 
             if self.recompute_granularity != 'selective' and self.recompute_num_layers is None:
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be between '
-                    f'1 and num_layers_per_pipeline_rank: {self.num_layers // self.pipeline_model_parallel_size}'
+                    f'When using recompute_granularity: {self.recompute_granularity} '
+                    'recompute_num_layers must be between '
+                    '1 and num_layers_per_pipeline_rank: '
+                    f'{self.num_layers // self.pipeline_model_parallel_size}'
                 )
             elif (
                 self.recompute_granularity == 'selective' and self.recompute_num_layers is not None
             ):
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be None.'
+                    f'When using recompute_granularity: {self.recompute_granularity} '
+                    'recompute_num_layers must be None.'
                 )
 
             if self.distribute_saved_activations and self.sequence_parallel:
                 raise ValueError(
-                    f'distribute_saved_activations: {self.distribute_saved_activations} must be false when sequence parallel is enabled: {self.sequence_parallel}'
+                    f'distribute_saved_activations: {self.distribute_saved_activations} must be '
+                    f'false when sequence parallel is enabled: {self.sequence_parallel}'
                 )
 
             if self.virtual_pipeline_model_parallel_size is not None:
                 if not self.num_layers % self.virtual_pipeline_model_parallel_size == 0:
                     raise ValueError(
-                        f'num_layers: {self.num_layers} must be divisible by virtual_model_parallel_size {self.virtual_pipeline_model_parallel_size}'
+                        f'num_layers: {self.num_layers} must be divisible by '
+                        f'virtual_model_parallel_size {self.virtual_pipeline_model_parallel_size}'
                     )
 
         if self.apply_query_key_layer_scaling:
@@ -454,7 +513,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.bias_activation_fusion:
             if self.activation_func not in [F.gelu, F.silu]:
                 raise ValueError(
-                    "When bias_activation_fusion is True, activation function should be either gelu or swiglu"
+                    "When bias_activation_fusion is True, activation function should be either "
+                    "gelu or swiglu"
                 )
             if (
                 self.activation_func == F.gelu
@@ -469,7 +529,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
         if self.apply_rope_fusion and self.rotary_interleaved:
-            raise ValueError(f'rotary_interleaved does not work with apply_rope_fusion.')
+            raise ValueError('rotary_interleaved does not work with apply_rope_fusion.')
 
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
@@ -487,5 +547,49 @@ class TransformerConfig(ModelParallelConfig):
             extended_tp_size = self.tensor_model_parallel_size * self.expert_model_parallel_size
             if self.ffn_hidden_size % extended_tp_size != 0:
                 raise ValueError(
-                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by extended_tp_size {extended_tp_size}'
+                    f'ffn_hidden_size: {self.ffn_hidden_size} must be divisible by '
+                    f'extended_tp_size {extended_tp_size}'
                 )
+
+        cuda_available = is_real_cuda_device_available()
+
+        if cuda_available and self.num_moe_experts and self.fp8:
+            # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
+            if not is_te_min_version("1.7.0.dev0"):
+                raise ValueError(
+                    "Only transformer-engine>=1.7.0 supports MoE FP8 training, "
+                    f"but your version is {get_te_version()}."
+                )
+
+            if self.moe_grouped_gemm:
+                raise ValueError("Grouped GEMM of MoE not support fp8 for now.")
+
+        if self.moe_dynamic_hpu:
+            assert (
+                not cuda_available
+            ), "moe_dynamic_hpu can be used only with HPU-specific Dynamic MoE kernels."
+            error_msg = ""
+            if self.moe_capacity_bins_num != 0:
+                error_msg += f"moe_capacity_bins_num={self.moe_capacity_bins_num} -> set it to 0. "
+            if self.moe_pad_expert_input_to_capacity:
+                error_msg += f"self.moe_pad_expert_input_to_capacity={self.moe_pad_expert_input_to_capacity} -> set it to False. "
+            if self.moe_expert_capacity_factor:
+                error_msg += f"self.moe_expert_capacity_factor={self.moe_expert_capacity_factor} -> set it to None."
+
+            if error_msg:
+                raise ValueError(
+                    f"MoE implementation IntelDynamicMLP can only be used with basic dropless token disptacher config, got invalid config: {error_msg}"
+                )
+
+
+_APPLY_CAG_DTYPE_CAST_WA = False
+
+
+def set_cag_dtype_cast_wa(state):
+    global _APPLY_CAG_DTYPE_CAST_WA
+    _APPLY_CAG_DTYPE_CAST_WA = state
+
+
+def apply_dtype_cast_wa():
+    global _APPLY_CAG_DTYPE_CAST_WA
+    return _APPLY_CAG_DTYPE_CAST_WA

@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,9 +33,8 @@ from transformers import (
     MixtralConfig,
     LlamaTokenizer,
     LlamaTokenizerFast,
-    PreTrainedTokenizerFast,
+    AutoTokenizer
 )
-from transformers.convert_slow_tokenizer import TikTokenConverter
 
 device = "cpu"
 
@@ -113,37 +112,13 @@ def add_checkpoint_conversion_args(parser):
         action=argparse.BooleanOptionalAction,
         help="Whether the recipe is an instruct model or not. Will affect special tokens for llama 3.1.",
     )
+    parser.add_argument(
+        "--save-capacity-bins",
+        action='store_true',
+        help="Save capacity bins parameters.",
+    )
 
     return parser
-
-# Sourced from
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py#L432
-class Llama3Converter(TikTokenConverter):
-    def __init__(
-        self, vocab_file, special_tokens=None, instruct=False, model_max_length=None, **kwargs
-    ):
-        super().__init__(vocab_file, additional_special_tokens=special_tokens, **kwargs)
-        tokenizer = self.converted()
-        chat_template = (
-            "{% set loop_messages = messages %}"
-            "{% for message in loop_messages %}"
-            "{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}"
-            "{% if loop.index0 == 0 %}"
-            "{% set content = bos_token + content %}"
-            "{% endif %}"
-            "{{ content }}"
-            "{% endfor %}"
-            "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
-        )
-
-        self.tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=tokenizer,
-            bos_token="<|begin_of_text|>",
-            eos_token="<|end_of_text|>" if not instruct else "<|eot_id|>",
-            chat_template=chat_template if instruct else None,
-            model_input_names=["input_ids", "attention_mask"],
-            model_max_length=model_max_length,
-        )
 
 
 def save_tokenizer(
@@ -151,12 +126,7 @@ def save_tokenizer(
 ):
 
     if source_model_type in ["llama3", "llama3.1"]:
-        tokenizer = Llama3Converter(
-            input_tokenizer_path,
-            special_tokens,
-            instruct,
-            model_max_length=CONTEXT_LENGTH_FOR_VERSION[source_model_type],
-        ).tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(input_tokenizer_path)
     else:
         tokenizer_class = LlamaTokenizerFast if LlamaTokenizerFast is not None else LlamaTokenizer
         if source_model_type == 'mixtral':
@@ -248,7 +218,7 @@ def merge_transformers_sharded_states(path, num_checkpoints):
         if not os.path.exists(checkpoint_path):
             checkpoint_path = os.path.join(path, f"pytorch_model-{i}-of-{num_checkpoints}.bin")
             assert os.path.exists(checkpoint_path), f"Cannot find checkpoint {checkpoint_path}"
-        current_chunk = torch.load(checkpoint_path, map_location=device)
+        current_chunk = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state_dict.update(current_chunk)
     return state_dict
 
@@ -295,7 +265,7 @@ def get_megatron_sharded_states(
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found in {checkpoint_path}")
 
-        state_dict = torch.load(checkpoint_path, map_location=device)
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
         tp_state_dicts.append(state_dict)
 
@@ -329,10 +299,14 @@ def convert_layers(
     capacity_bins_state_dict: dict,
     layer_re: re.Pattern,
     moe_op_name_re: re.Pattern,
+    capacity_bins_re: re.Pattern,
     tp_size: int,
+    pp_size: int,
     pp_rank: int,
+    ep_size: int,
     ep_rank: Optional[int],
     moe_tp: bool,
+    num_layers: int,
     num_layers_per_pp_stage: int,
     num_layers_per_ep_stage: Optional[int],
     qkv_total_dim: int,
@@ -342,6 +316,7 @@ def convert_layers(
     num_query_groups: int,
     rotary_base: float,
     dtype: torch.dtype,
+    save_capacity_bins: bool,
 ):
     # Extract the layers.
     for key, val in tp_state_dicts[0]["model"].items():
@@ -353,7 +328,7 @@ def convert_layers(
 
             if source_model_type == 'mixtral':
                 # For ep ranks > 0 we convert only MoE layers.
-                if ep_rank > 0 and not is_expert_layer:
+                if ep_rank > 0 and not is_expert_layer and not "capacity_bins" in key:
                     continue
 
             # Stop if that's not a layer.
@@ -363,16 +338,41 @@ def convert_layers(
 
             print("processing: ", key)
 
-            if "capacity_bins" in key:
-                capacity_bins_state_dict[key] = val
-                continue
-
             # The index of the layer.
             layer_idx = int(match.group(2)) + pp_rank * num_layers_per_pp_stage
             moe_layer_idx = None
 
             # The name of the operation.
             op_name = match.group(3)
+
+            if save_capacity_bins and "capacity_bins" in key:
+                # There are different capacity bins values for each rank and layer.
+                for tp_rank in range(0, tp_size):
+                    cb_tp = tp_state_dicts[tp_rank]["model"][key]
+                    
+                    cb_match = capacity_bins_re.match(key)
+                    # We want only the last part, e.g. cb_name = 'bins_usage'.
+                    cb_name = f"{cb_match.group(2)}"
+
+                    # This method of saving capacity bins is needed to
+                    # ensure, that the Megatron-LM model can be accurately
+                    # reconstructed when converting the checkpoint back using
+                    # `loader_mixtral_hf.py`.
+                    # Capacity bins are not used in Hugging Face.
+                    if cb_name not in capacity_bins_state_dict:
+                        capacity_bins_state_dict.update({
+                            cb_name: {
+                                layer_idx: {
+                                    pp: {
+                                        ep: {
+                                            tp: {} for tp in range(tp_size)
+                                        } for ep in range(ep_size)
+                                    } for pp in range(pp_size)
+                                } for layer_idx in range(num_layers)
+                            }
+                        })
+                    capacity_bins_state_dict[cb_name][layer_idx][pp_rank][ep_rank][tp_rank] = cb_tp
+                continue
 
             # Is it a weight or a bias?
             weight_or_bias = match.group(4)
@@ -390,7 +390,7 @@ def convert_layers(
             params = val.to(dtype)
 
             if param_key in tensor_parallel_params:
-                dim = 1 if op_name in ["self_attention.linear_proj", "linear_fc2"] else 0
+                dim = 1 if op_name in ["self_attention.linear_proj", "linear_fc2", "mlp.linear_fc2"] else 0
                 for tp_rank in range(0, tp_size):
                     if tp_rank > 0:
                         tp_tensor = tp_state_dicts[tp_rank]["model"][key].to(dtype)
@@ -451,7 +451,7 @@ def convert_layers(
                     # Converts Llama mlp.linear_fc1 weights.
 
                     # Split params across tensor parallel size and process chunks simultaneously
-                    gate_chunks, up_chunks = zip(*[t.chunk(2) for t in params.chunk(dim=0, chunks=megatron_args.tensor_model_parallel_size)])
+                    gate_chunks, up_chunks = zip(*[t.chunk(2) for t in params.chunk(dim=0, chunks=tp_size)])
 
                     # concat chunks at once, reducing memory allocations
                     gate = torch.cat(gate_chunks).to(dtype).contiguous()
@@ -466,8 +466,7 @@ def convert_layers(
 
                 base_name = f"{layer_name}.block_sparse_moe.experts.{moe_layer_idx}."
                 if op_name == "linear_fc1":
-                    split_size = params.size(0) // 2
-                    w1, w3 = torch.split(params, split_size, dim=0)
+                    w1, w3 = params.chunk(chunks=2, dim=0)
                     output_state_dict[base_name + "w1.weight"] = w1.clone().to(dtype)
                     output_state_dict[base_name + "w3.weight"] = w3.clone().to(dtype)
                 else: # op_name == "linear_fc2"
@@ -560,7 +559,7 @@ def convert_checkpoint_from_megatron_to_transformers(args):
             rank0_ckpt_path = os.path.join(state_path, sub_dir, "model_optim_rng.pt")
             break
     print(f"Loading Megatron-LM checkpoint arguments from: {rank0_ckpt_path}")
-    state_dict = torch.load(rank0_ckpt_path, map_location=device)
+    state_dict = torch.load(rank0_ckpt_path, map_location=device, weights_only=False)
     megatron_args = state_dict.get("args", None)
     del state_dict
     if megatron_args is None:
@@ -714,10 +713,12 @@ def convert_checkpoint_from_megatron_to_transformers(args):
         moe_tp = False
 
     # The regex to extract layer names.
-    # example: "model.layers.0.self_attention.linear_proj.weight"
+    # Example: "decoder.layers.0.self_attention.linear_proj.weight"
     layer_re = re.compile(r"([a-z0-9_.]+)\.layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
-    # example: "decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight"
+    # Example: "decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight"
     moe_op_name_re = re.compile(r"mlp\.experts\.local_experts\.(\d+)\.([a-z0-9_.]+)")
+    # Example: "decoder.layers.0.mlp.router.capacity_bins.bins_usage"
+    capacity_bins_re = re.compile(r"([a-z0-9_.]+)\.capacity_bins\.([a-z_.]+)")
 
     # Embeddings
     print("Converting embeddings")
@@ -766,10 +767,12 @@ def convert_checkpoint_from_megatron_to_transformers(args):
         layer_idx = convert_layers(
             args.source_model_type, tp_state_dicts, moe_tp_state_dicts,
             output_state_dict, capacity_bins_state_dict, layer_re,
-            moe_op_name_re, tp_size, pp_rank, ep_rank, moe_tp,
+            moe_op_name_re, capacity_bins_re, tp_size, pp_size, pp_rank,
+            ep_size, ep_rank, moe_tp, megatron_args.num_layers,
             num_layers_per_pp_stage, num_layers_per_ep_stage, qkv_total_dim,
-            hidden_size, heads_per_group, hidden_size_per_head, num_query_groups,
-            float(megatron_args.rotary_base), dtype
+            hidden_size, heads_per_group, hidden_size_per_head,
+            num_query_groups, float(megatron_args.rotary_base), dtype,
+            args.save_capacity_bins
         )
 
     if not moe_tp and args.source_model_type == "mixtral":
@@ -782,10 +785,13 @@ def convert_checkpoint_from_megatron_to_transformers(args):
                 layer_idx = convert_layers(
                     args.source_model_type, tp_state_dicts, moe_tp_state_dicts,
                     output_state_dict, capacity_bins_state_dict, layer_re,
-                    moe_op_name_re, tp_size, pp_rank, ep_rank, False,
-                    num_layers_per_pp_stage, num_layers_per_ep_stage, qkv_total_dim,
-                    hidden_size, heads_per_group, hidden_size_per_head,
-                    num_query_groups, float(megatron_args.rotary_base), dtype
+                    moe_op_name_re, capacity_bins_re, tp_size, pp_size, pp_rank,
+                    ep_size, ep_rank, False, megatron_args.num_layers,
+                    num_layers_per_pp_stage, num_layers_per_ep_stage,
+                    qkv_total_dim, hidden_size, heads_per_group,
+                    hidden_size_per_head, num_query_groups,
+                    float(megatron_args.rotary_base), dtype,
+                    args.save_capacity_bins
                 )
 
 
@@ -826,7 +832,9 @@ def convert_checkpoint_from_megatron_to_transformers(args):
         state_dict=output_state_dict, save_directory=args.save_path, max_shard_size=max_shard_size
     )
 
-    if len(capacity_bins_state_dict) > 0:
+    if args.save_capacity_bins:
+        if len(capacity_bins_state_dict) == 0:
+            print("WARNING: Capacity bins state dict is empty.")
         # Save capacity bins parameters.    
         torch.save(capacity_bins_state_dict, os.path.join(args.save_path, "capacity_bins.pt"))
 

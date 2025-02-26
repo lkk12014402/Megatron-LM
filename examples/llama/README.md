@@ -27,7 +27,6 @@ Users bear sole liability and responsibility to follow and comply with any third
     | ---------------------- | ----------------- | ------------------- | -------------------- | ------- |
     | LLaMA 2                | PyTorch           | Pretraining         | [Use Policy](https://github.com/meta-llama/llama-models/blob/main/models/llama2/USE_POLICY.md) | [License](https://github.com/meta-llama/llama-models/blob/main/models/llama2/LICENSE) |
     | LLaMA 3.1              | PyTorch           | Pretraining         | [Use Policy](https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/USE_POLICY.md) | [License](https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/LICENSE) |
-    | Meta LLaMA 3 Tokenizer | PyTorch           | Tokenizer Support   | [Use Policy](https://github.com/meta-llama/llama3/blob/main/USE_POLICY.md) | [License](https://github.com/meta-llama/llama3/blob/main/LICENSE) |
 
 ## Prerequisites
 * When creating Docker container, set the shared memory size as 10 GB through the Docker run command:
@@ -70,7 +69,7 @@ export PYTHONPATH=$MEGATRON_LM_ROOT:$PYTHONPATH
   ```
 
 ## Dataset Preparation
-Follow the instructions in https://github.com/bigscience-workshop/bigscience/tree/master/data/oscar to download oscar-en full dataset. Note that the dataset takes around 550G of disk space. This dataset is used for training LLaMA & LLaMA 2.
+Follow the instructions in https://github.com/bigscience-workshop/bigscience/tree/master/data/oscar to download oscar-en full dataset. Note that the dataset takes around 550G of disk space. This dataset is used for training LLaMA, LLaMA 2 and LLaMA 3.1.
 ### Dataset Preparation Example
 The below provides the steps required to prepare your dataset. It is based on instructions in https://github.com/bigscience-workshop/bigscience/tree/master/data/oscar. This example uses the `zh` dataset.
 ### Step 0 :
@@ -103,6 +102,9 @@ Use one of the three methods below to tokenize the dataset. You can use any numb
     # tokenize individual jsonl files
     # loop count will change based on number of files for a given dataset
     mkdir zh_tokenized
+    mkdir zh_tokenized_merged
+    cp zh/gpt2-vocab.json zh_tokenized_merged/
+    cp zh/gpt2-merges.txt zh_tokenized_merged/
     for i in $(seq 0 4);
     do
       $PYTHON $MEGATRON_LM_ROOT/tools/preprocess_data.py --input oscar-${i}.jsonl --output-prefix zh_tokenized/tokenized${i} --tokenizer-type GPT2BPETokenizer --vocab-file gpt2-vocab.json --merge-file gpt2-merges.txt --append-eod --workers 80
@@ -114,16 +116,34 @@ Use one of the three methods below to tokenize the dataset. You can use any numb
     # tokenize individual jsonl files
     # loop count will change based on number of files for a given dataset
     mkdir zh_tokenized
+    mkdir zh_tokenized_merged
+    # copy downloaded tokenizer.model to zh_tokenized_merged
     for i in $(seq 0 4);
     do
       $PYTHON $MEGATRON_LM_ROOT/tools/preprocess_data.py --input oscar-${i}.jsonl --output-prefix zh_tokenized/tokenized${i} --tokenizer-type GPTSentencePieceTokenizer --tokenizer-model /path/to/tokenizer.model --append-eod --workers 80
+    done
+    ```
+  * Tokenize the dataset using HuggingFaceTokenizer:
+    ```bash
+    # path to tokenizer can be local directory
+    #  or
+    # path to tokenizer can be link to huggingface repo model card
+    # if huggingface repo model card is a gated repo, Log in using a token from huggingface.co/settings/tokens with below command
+    # huggingface-cli login
+    # tokenize individual jsonl files
+    # loop count will change based on number of files for a given dataset
+    mkdir zh_tokenized
+    mkdir zh_tokenized_merged
+    # copy downloaded tokenizer to zh_tokenized_merged
+    for i in $(seq 0 4);
+    do
+      $PYTHON $MEGATRON_LM_ROOT/tools/preprocess_data.py --input oscar-${i}.jsonl --output-prefix zh_tokenized/tokenized${i} --tokenizer-type HuggingFaceTokenizer --tokenizer-model /path/to/tokenizer --append-eod --workers 80
     done
     ```
 ### Step 4 :
  * Merge multiple tokenized dataset files into a single file using the below method:
     ```bash
     # merge tokenized files
-    mkdir zh_tokenized_merged
     $PYTHON $MEGATRON_LM_ROOT/tools/merge_datasets.py --input zh_tokenized --output-prefix zh_tokenized_merged/tokenized_text_document
     # use the tokenized files generated from above command to train
     ```
@@ -133,10 +153,6 @@ Use one of the three methods below to tokenize the dataset. You can use any numb
   ```
   HL_TOKENIZER_TYPE=GPT2BPETokenizer
   ```
-* Run custom tokenizer code from local path using HFTokenizer method:
-  ```
-  HL_TRUST_REMOTE_CODE=1
-  ```
 * Update data root dir with the path of your choice:
   ```
   HL_DATA_DIR_ROOT=/data/bigscience/oscar-en
@@ -145,9 +161,9 @@ Use one of the three methods below to tokenize the dataset. You can use any numb
   ```
   HL_DATA_FILE_PREFIX=tokenized_text_document
   ```
-* Update tokenizer.model file path if it is not in data root dir, required for any sentence piece based tokenizer:
+* Update tokenizer path if it is not in data root dir, required for any sentence piece based tokenizer:
   ```
-  HL_TOKENIZER_MODEL=path/to/tokenizer.model
+  HL_TOKENIZER_MODEL=path/to/tokenizer
   ```
 
 Note: For the training commands, make sure to change the IP addresses in hostsfile according to your setup.
@@ -174,7 +190,7 @@ must be shared and accessible across all nodes and launchers when running traini
   HL_FP8=1 \
   HL_TRANSFORMER_IMPL=transformer_engine \
   HL_SEQ_PARALLEL=0 \
-  HL_TOKENIZER_TYPE=Llama3Tokenizer \
+  HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
   HL_CKP_ACT=2 \
   HL_LLAMA_VER=3.1 \
   HL_DP=4 \
@@ -184,7 +200,7 @@ must be shared and accessible across all nodes and launchers when running traini
   $MEGATRON_LM_ROOT/examples/llama/pretrain_llama.sh
 
   # BF16 config
-  HL_TOKENIZER_TYPE=Llama3Tokenizer \
+  HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
   HL_CKP_ACT=2 \
   HL_LLAMA_VER=3.1 \
   HL_DP=4 \
@@ -202,7 +218,7 @@ must be shared and accessible across all nodes and launchers when running traini
   HL_FP8=1 \
   HL_TRANSFORMER_IMPL=transformer_engine \
   HL_SEQ_PARALLEL=0 \
-  HL_TOKENIZER_TYPE=Llama3Tokenizer \
+  HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
   HL_CKP_ACT=2 \
   HL_NUM_NODES=8 \
   HL_LLAMA_VER=3.1 \
@@ -213,7 +229,7 @@ must be shared and accessible across all nodes and launchers when running traini
   $MEGATRON_LM_ROOT/examples/llama/pretrain_llama.sh
 
   # BF16 config
-  HL_TOKENIZER_TYPE=Llama3Tokenizer \
+  HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
   HL_CKP_ACT=2 \
   HL_NUM_NODES=8 \
   HL_LLAMA_VER=3.1 \
@@ -225,12 +241,13 @@ must be shared and accessible across all nodes and launchers when running traini
 
 #### Sequence Length 32768
 * Run LLaMA 3.1 8B on 8 HPUs with BF16 precision:
+
   ```bash
   # Retain default settings for optimal performance.
 
   HL_NUM_WORKERS=0 \
   HL_SEQ_LEN=32768 \
-  HL_TOKENIZER_TYPE=Llama3Tokenizer \
+  HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
   HL_CKP_ACT=2 \
   HL_LLAMA_VER=3.1 \
   HL_LLAMA_MODEL_SIZE=8 \
@@ -246,7 +263,7 @@ must be shared and accessible across all nodes and launchers when running traini
 
   HL_NUM_WORKERS=0 \
   HL_SEQ_LEN=32768 \
-  HL_TOKENIZER_TYPE=Llama3Tokenizer \
+  HL_TOKENIZER_TYPE=HuggingFaceTokenizer \
   HL_CKP_ACT=1 \
   HL_NUM_NODES=4 \
   HL_LLAMA_VER=3.1 \
@@ -275,6 +292,5 @@ must be shared and accessible across all nodes and launchers when running traini
 
 # Known Issues
 * Only scripts and configurations mentioned in this README are supported and verified.
-* HL_PP > 1 configurations in training with fp8 precision are not supported.
-* Using HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1 in training with fp8 precision is not supported.
-* Sporadic numerical instability can occur when training with fp8 precision.
+* Full recompute option is currently not supported in HL_PP > 1 configurations in training with fp8 precision.
+* Sporadic numerical and stability issues can occur when training with fp8 precision and fast softmax enabled.

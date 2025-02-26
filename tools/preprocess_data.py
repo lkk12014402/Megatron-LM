@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Processing large data for pretraining."""
@@ -17,8 +17,10 @@ import numpy as np
 import multiprocessing
 try:
     import nltk
+    from nltk.tokenize.punkt import PunktLanguageVars
     nltk_available = True
 except ImportError:
+    PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
 from megatron.training.tokenizer import build_tokenizer
@@ -26,7 +28,7 @@ from megatron.core.datasets import indexed_dataset
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
-class CustomLanguageVars(nltk.tokenize.punkt.PunktLanguageVars):
+class CustomLanguageVars(PunktLanguageVars):
 
     _period_context_fmt = r"""
         \S*                          # some word material
@@ -218,11 +220,13 @@ def get_args():
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
                                 'GPT2BPETokenizer', 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer', 'Llama2Tokenizer',
-                                'Llama3Tokenizer', 'MistralTokenizer',
+                                'HuggingFaceTokenizer', 'MistralTokenizer',
                                 'ChameleonTokenizer', 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='YTTM tokenizer model.')
+    group.add_argument('--seq-length', type=int, default=None,
+                       help='Maximum sequence length to process.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
     group.add_argument('--vocab-size', default=786,

@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Intel Corporation
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
@@ -11,15 +11,12 @@ from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
 )
-from megatron.core.tensor_parallel.random import (
-    get_cuda_rng_tracker,
-    get_data_parallel_rng_tracker_name,
-)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.capacity_bins import CapacityBins
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     save_to_aux_losses_tracker,
+    save_token_distribution_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_softmax_with_capacity,
@@ -46,7 +43,7 @@ class Router(ABC, MegatronModule):
 
         # Initialize the gate weights.
         self.weight = torch.nn.Parameter(
-            torch.empty((self.config.num_moe_experts, self.config.hidden_size))
+            torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
         )
         if config.perform_initialization:
             if get_cuda_rng_tracker().is_initialized():
@@ -54,6 +51,10 @@ class Router(ABC, MegatronModule):
                     config.init_method(self.weight)
         else:
             config.init_method(self.weight)
+
+        if not self.config.moe_router_fp32:
+            self.weight.data = self.weight.data.to(dtype=config.params_dtype)
+
         setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
 
     def gating(self, input: torch.Tensor):
@@ -65,6 +66,9 @@ class Router(ABC, MegatronModule):
         Returns:
             torch.Tensor: Logits tensor.
         """
+        if self.weight.device.type == 'cpu':
+            # move weights to GPU
+            self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
         logits = torch.nn.functional.linear(input, self.weight)
         return logits
 
@@ -76,7 +80,8 @@ class Router(ABC, MegatronModule):
             logits (torch.Tensor): Logits tensor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Tuple of tensors representing max probs and the indices.
+            Tuple[torch.Tensor, torch.Tensor]:
+                Tuple of tensors representing max probs and the indices.
         """
         raise NotImplementedError("Routing function not implemented.")
 
@@ -98,10 +103,7 @@ class Router(ABC, MegatronModule):
 class TopKRouter(Router):
     """Route each token to the top-k experts."""
 
-    def __init__(
-        self,
-        config: TransformerConfig,
-    ) -> None:
+    def __init__(self, config: TransformerConfig) -> None:
         """Initialize the zero token dropping router.
 
         Args:
@@ -115,6 +117,9 @@ class TopKRouter(Router):
         self.capacity_bins_alignment = self.config.moe_capacity_bins_alignment
         self.configured_bins = self.config.moe_configured_bins
         self.capacity_bins = None
+        # Explicit fp32 conversion for better accuracy
+        self.fp32 = self.config.moe_router_fp32
+
         if self.capacity_bins_num > 0:
             assert (
                 self.capacity_bins_exp_base >= 1.0
@@ -184,6 +189,16 @@ class TopKRouter(Router):
             # Apply load balancing loss
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             probs = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=probs)
+            # In case we are checkpointing we want to store token distribution only once
+            if torch.is_grad_enabled():
+                save_token_distribution_tracker(
+                    'token_distribution',
+                    tokens_per_expert,
+                    self.layer_number,
+                    self.config.num_layers,
+                    parallel_state.get_data_parallel_group(),
+                )
+
         return probs, indices
 
     def apply_load_balancing_loss(
@@ -195,10 +210,10 @@ class TopKRouter(Router):
         """Applies auxiliary loss to the MoE layer.
 
         Args:
-            probs (torch.Tensor): The probs output by the router for each token.
-                [num_tokens, num_experts]
-            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert.
-                [num_experts]
+            probs (torch.Tensor):
+                The probs output by the router for each token. [num_tokens, num_experts]
+            num_local_tokens_per_expert (torch.Tensor):
+                The number of tokens per expert. [num_experts]
             activation (torch.Tensor): The activation tensor to attach the gradient function to.
 
         Returns:
@@ -304,6 +319,7 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
                 drop_policy=self.config.moe_token_drop_policy,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
+                deterministic_mode=self.config.deterministic_mode,
                 capacity_bins=self.capacity_bins,
             )
         else:
@@ -320,18 +336,23 @@ class TopKRouter(Router):
         """
         self.hidden = input.shape[-1]
 
+        if self.fp32:
+            input_dtype = input.dtype
+            input = input.type(torch.float32)
+            self.weight.data = self.weight.data.type(torch.float32)
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
         logits = logits.view(-1, self.config.num_moe_experts)
-
         scores, indices = self.routing(logits)
+        if self.fp32:
+            scores = scores.type(input_dtype)
 
         return scores, indices
 
-    def get_stats(self, incremental=True):
+    def get_stats(self, bins_state_name=None):
         if self.capacity_bins is not None:
-            capacity_stats = self.capacity_bins.get_stats(incremental)
+            capacity_stats = self.capacity_bins.get_stats(bins_state_name)
             if capacity_stats is not None:
                 return {'capacity_bins': capacity_stats}
         return None

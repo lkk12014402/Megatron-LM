@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from __future__ import annotations
@@ -26,10 +26,11 @@ try:
     )
 
     HAVE_APPLY_ROPE_FUSION = True
-except:
+except ImportError:
     HAVE_APPLY_ROPE_FUSION = False
     try:
         from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingHelperV1
+
         HAVE_APPLY_ROPE_FUSION = True
     except:
         pass
@@ -179,7 +180,13 @@ def _rotate_half(x: Tensor, rotary_interleaved: bool) -> Tensor:
         return x_new.view(x_new.shape[0], x_new.shape[1], x_new.shape[2], -1)
 
 
-def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, rotary_interleaved: bool = False, cos_cached: Tensor = None, sin_cached: Tensor = None) -> Tensor:
+def apply_rotary_pos_emb_bshd(
+    t: Tensor,
+    freqs: Tensor,
+    rotary_interleaved: bool = False,
+    cos_cached: Tensor = None,
+    sin_cached: Tensor = None,
+) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
 
     check https://kexue.fm/archives/8265 for detailed formulas
@@ -208,17 +215,24 @@ def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, rotary_interleaved: bool
         t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
     else:
         if cos_cached is None or sin_cached is None or t.shape[0] != cos_cached.shape[0]:
-            freqs_ = freqs[:t.shape[0]]
+            freqs_ = freqs[: t.shape[0]]
             cos_cached = freqs_.cos().to(t.dtype)
             sin_cached = freqs_.sin().to(t.dtype)
-        t = RotaryPosEmbeddingHelperV1.apply(t, cos_cached, sin_cached, 0) # offset already used in RotaryEmbedding.forward
+        t = RotaryPosEmbeddingHelperV1.apply(
+            t, cos_cached, sin_cached, 0
+        )  # offset already used in RotaryEmbedding.forward
     if t_pass is None:
         return t
     return torch.cat((t, t_pass), dim=-1)
 
 
 def apply_rotary_pos_emb_thd(
-    t: Tensor, cu_seqlens: Tensor, freqs: Tensor, rotary_interleaved: bool = False, cos_cached: Tensor = None, sin_cached: Tensor = None
+    t: Tensor,
+    cu_seqlens: Tensor,
+    freqs: Tensor,
+    rotary_interleaved: bool = False,
+    cos_cached: Tensor = None,
+    sin_cached: Tensor = None,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -247,7 +261,7 @@ def apply_rotary_pos_emb(
     config: TransformerConfig,
     cu_seqlens: Optional[Tensor] = None,
     cos_cached: Tensor = None,
-    sin_cached: Tensor = None
+    sin_cached: Tensor = None,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -272,8 +286,19 @@ def apply_rotary_pos_emb(
             return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
     else:
         if cu_seqlens is None:
-            return apply_rotary_pos_emb_bshd(t, freqs, rotary_interleaved=config.rotary_interleaved, cos_cached=cos_cached, sin_cached=sin_cached)
+            return apply_rotary_pos_emb_bshd(
+                t,
+                freqs,
+                rotary_interleaved=config.rotary_interleaved,
+                cos_cached=cos_cached,
+                sin_cached=sin_cached,
+            )
         else:
             return apply_rotary_pos_emb_thd(
-                t, cu_seqlens, freqs, rotary_interleaved=config.rotary_interleaved, cos_cached=cos_cached, sin_cached=sin_cached
+                t,
+                cu_seqlens,
+                freqs,
+                rotary_interleaved=config.rotary_interleaved,
+                cos_cached=cos_cached,
+                sin_cached=sin_cached,
             )

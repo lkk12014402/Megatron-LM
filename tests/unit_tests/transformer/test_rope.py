@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
@@ -22,6 +23,8 @@ class TestRotaryEmbedding:
         )
 
     def teardown_method(self, method):
+        del self.rope_gpu_init
+        del self.rope_cpu_init
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -29,7 +32,7 @@ class TestRotaryEmbedding:
         assert isinstance(self.rope_cpu_init, RotaryEmbedding)
         assert self.rope_cpu_init.inv_freq.device.type == 'cpu'
         assert isinstance(self.rope_gpu_init, RotaryEmbedding)
-        assert self.rope_gpu_init.inv_freq.device.type == 'cuda'
+        assert self.rope_gpu_init.inv_freq.device.type in ['cuda', 'hpu']
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_forward(self):
@@ -39,7 +42,7 @@ class TestRotaryEmbedding:
         assert output.shape[2] == 1
         assert output.shape[3] == self.kv_channels
         assert output.dtype == torch.float32
-        assert output.device.type == 'cuda'
+        assert output.device.type in ['cuda', 'hpu']
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cpu_forward(self):
@@ -49,4 +52,4 @@ class TestRotaryEmbedding:
         assert output.shape[2] == 1
         assert output.shape[3] == self.kv_channels
         assert output.dtype == torch.float32
-        assert output.device.type == 'cuda'
+        assert output.device.type in ['cuda', 'hpu']

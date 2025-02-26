@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 
 set -ex
 
@@ -16,15 +16,15 @@ NUM_NODES=${HL_NUM_NODES:-1}
 DP=${HL_DP:-2}
 TP=${HL_TP:-2}
 PP=${HL_PP:-2}
+CP=${HL_CP:-1}
 MICRO_BATCH_SIZE=${HL_MICRO_BATCH:-1} # batch_size
 EXIT_INTERVAL=${HL_EXIT_INTERVAL:-0}
 OUTPUT_DIR=${HL_RESULTS_DIR:-}
 OUTPUT_DIR_PREFIX=${HL_RESULTS_DIR_PREFIX:-.}
 CHECKPOINT_SAVE=${HL_SAVE:-1}
 SAVE_INTERVAL=${HL_SAVE_INTERVAL:-2000}
-DIST_CKPT_FORMAT=${HL_DIST_CKPT_FORMAT:-torch_dist}
+CKPT_FORMAT=${HL_CKPT_FORMAT:-torch} # torch, torch_dist and zarr
 USE_DISTRIBUTED_OPTIMIZER=${HL_USE_DISTRIBUTED_OPTIMIZER:-1}
-USE_DIST_CKPT=${HL_USE_DIST_CKPT:-0}
 LOAD_DIR=${HL_LOAD_DIR:-}
 CHECKPOINTS_DIR=${HL_CHECKPOINTS_DIR:-}
 VERIFY_CKPT=${HL_VERIFY_CKPT:-1}
@@ -57,27 +57,25 @@ FP8_FORMAT=${HL_FP8_FORMAT:-hybrid} # hybrid or e5m2
 FP8_MARGIN=${HL_FP8_MARGIN:-0}
 FP8_AMAX_COMPUTE_ALGO=${HL_FP8_AMAX_COMPUTE_ALGO:-max} # max or most_recent
 USE_TORCH_COMPILE=${HL_USE_TORCH_COMPILE:-0}
+USE_TORCH_COMPILED_AUTOGRAD=${HL_USE_TORCH_COMPILED_AUTOGRAD:-0}
 USE_LAZY_MODE=${HL_USE_LAZY_MODE:-1}
 SKIP_TRAIN=${HL_SKIP_TRAIN:-0}
 NUM_WORKERS=${HL_NUM_WORKERS:-2}
-FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False attention=False"}
+FP8_COVERAGE=${HL_FP8_COVERAGE:-"mlp_row_parallel=False attention=True"}
+CACHE_FP8_WEIGHT=${HL_CACHE_FP8_WEIGHT:-1}
+CACHE_FP8_WEIGHT_FWD=${HL_CACHE_FP8_WEIGHT_FWD:-1}
 
 if [[ -z "${MEGATRON_LM_ROOT}" ]]; then
     MEGATRON_LM_ROOT=$(realpath "$(dirname "$0")"/../../)
 fi
 
-if [[ $((NUM_NODES*DEVICES_PER_NODE)) -ne $((DP*TP*PP)) ]]; then
-    echo "NUM_NODES*DEVICES_PER_NODE != DP*TP*PP"
+if [[ $((NUM_NODES*DEVICES_PER_NODE)) -ne $((DP*TP*PP*CP)) ]]; then
+    echo "NUM_NODES*DEVICES_PER_NODE != DP*TP*PP*CP"
     exit 1
 fi
 
 if [[ "${TRANSFORMER_IMPL}" = "local" && "${FP8}" -eq 1 ]]; then
     echo "fp8 is not supported with local transformer implementation"
-    exit 1
-fi
-
-if [[ "$USE_LAZY_MODE" = 1 && "$USE_TORCH_COMPILE" = 1 ]]; then
-    echo "Cannot use lazy(HL_USE_LAZY_MODE) and torch.compile(HL_USE_TORCH_COMPILE) modes together"
     exit 1
 fi
 
@@ -163,7 +161,7 @@ elif [[ "${LLAMA_VER}" = "2" ]]; then
         exit 1
     fi
 elif [[ "${LLAMA_VER}" = "3.1" ]]; then
-    TOKENIZER_TYPE=${HL_TOKENIZER_TYPE:-Llama3Tokenizer}
+    TOKENIZER_TYPE=${HL_TOKENIZER_TYPE:-HuggingFaceTokenizer}
     GLOBAL_BATCH_SIZE=${HL_GBS:-2048} # microbatches in the pipeline (computed as `GLOBAL_BATCH / (DP * MICRO_BATCH)`) should be divisible by the PP
     MAX_SEQ_LEN=${HL_SEQ_LEN:-8192}
     TRAIN_ITERS=${HL_TRAIN_ITERS:-937500}
@@ -232,7 +230,7 @@ if [[ -z "${OUTPUT_DIR}" ]]; then
     if [[ "${FP8}" -eq 1 ]]; then
         data_type="fp8"
     fi
-    OUTPUT_DIR=${OUTPUT_DIR_PREFIX}/out/llama${LLAMA_VER}_${LLAMA_MODEL_SIZE}b/${data_type}_${TRANSFORMER_IMPL}_${EXP_NAME}_nl${NUM_LAYERS}_hs${HIDDEN_SIZE}_ffn${FFN_HIDDEN_SIZE}_gb${GLOBAL_BATCH_SIZE}_mb${MICRO_BATCH_SIZE}_sp${SEQ_PARALLEL}_D${DP}_T${TP}_P${PP}_devices${NUM_DEVICES}_${RUNTIME}
+    OUTPUT_DIR=${OUTPUT_DIR_PREFIX}/out/llama${LLAMA_VER}_${LLAMA_MODEL_SIZE}b/${data_type}_${TRANSFORMER_IMPL}_${EXP_NAME}_ckpact${CKP_ACT}_nl${NUM_LAYERS}_hs${HIDDEN_SIZE}_ffn${FFN_HIDDEN_SIZE}_gb${GLOBAL_BATCH_SIZE}_mb${MICRO_BATCH_SIZE}_sp${SEQ_PARALLEL}_D${DP}_T${TP}_P${PP}_devices${NUM_DEVICES}_${RUNTIME}
 fi
 if [[ -z "${CHECKPOINTS_DIR}" ]]; then
     CHECKPOINTS_DIR=${OUTPUT_DIR}/checkpoints
@@ -265,6 +263,19 @@ fi
 PT_HPU_GPU_MIGRATION=1
 PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${HL_FP8_ENFORCE_BF16_AMAX_REDUCTION:-1}
 
+if [[ -z "${HL_TE_LIMIT_GRAPH_SIZE}" ]]; then
+    # Limit TE graph size only for LLaMa 3.1 8B scenario
+    if [[ "${LLAMA_VER}" = "3.1" ]] && [[ "${LLAMA_MODEL_SIZE}" = "8" ]] && [[ ${DP} = 8 ]] && [[ $((NUM_NODES*DEVICES_PER_NODE)) = 8 ]]; then
+        PT_TE_LIMIT_GRAPH_SIZE=1
+    fi
+else
+    PT_TE_LIMIT_GRAPH_SIZE=${HL_TE_LIMIT_GRAPH_SIZE:-0}
+fi
+
+if [[ "${LLAMA_VER}" = "3.1" ]] && [[ "${LLAMA_MODEL_SIZE}" = "8" ]]; then
+    CACHE_FP8_WEIGHT=${HL_CACHE_FP8_WEIGHT:-0}
+    CACHE_FP8_WEIGHT_FWD=${HL_CACHE_FP8_WEIGHT_FWD:-0}
+fi
 # Set training command
 CMD=""
 if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
@@ -274,6 +285,7 @@ if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
     CMD="${CMD} --bind-to none"
     CMD="${CMD} -x PT_HPU_GPU_MIGRATION=${PT_HPU_GPU_MIGRATION}"
     CMD="${CMD} -x PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${PT_TE_ENFORCE_BF16_AMAX_REDUCTION}"
+    CMD="${CMD} -x PT_TE_LIMIT_GRAPH_SIZE=${PT_TE_LIMIT_GRAPH_SIZE}"
     if [[ "${NUM_NODES}" -ne "1" ]]; then
         CMD="${CMD} -hostfile ${HOSTSFILE}"
         CMD="${CMD} -x MASTER_ADDR=$(head -n 1 "${HOSTSFILE}" | sed -n s/[[:space:]]slots.*//p)"
@@ -287,6 +299,8 @@ elif [[ "${LAUNCHER_TYPE}" = "torchrun" ]]; then
         exit 1
     fi
     export PT_HPU_GPU_MIGRATION=${PT_HPU_GPU_MIGRATION}
+    export PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${PT_TE_ENFORCE_BF16_AMAX_REDUCTION}
+    export PT_TE_LIMIT_GRAPH_SIZE=${PT_TE_LIMIT_GRAPH_SIZE}
     CMD="${CMD} torchrun"
     CMD="${CMD} --nnodes ${NUM_NODES}"
     CMD="${CMD} --nproc-per-node ${DEVICES_PER_NODE}"
@@ -308,6 +322,7 @@ CMD="${CMD} \
     --transformer-impl ${TRANSFORMER_IMPL} \
     --tensor-model-parallel-size ${TP} \
     --pipeline-model-parallel-size ${PP} \
+    --context-parallel-size ${CP} \
     --distributed-backend nccl \
     --seq-length ${MAX_SEQ_LEN} \
     --num-layers ${NUM_LAYERS} \
@@ -334,6 +349,7 @@ CMD="${CMD} \
     --lr-warmup-iters ${LR_WARMUP_ITERS} \
     --min-lr ${MIN_LR} \
     --use-torch-compile=${USE_TORCH_COMPILE} \
+    --use-torch-compiled-autograd=${USE_TORCH_COMPILED_AUTOGRAD} \
     --use-fused-sdpa-with-recompute ${USE_FUSED_SDPA_WITH_RECOMPUTE} \
     --use-fused-sdpa ${USE_FUSED_SDPA} \
     --use-fused-rmsnorm ${USE_FUSED_RMSNORM} \
@@ -352,9 +368,9 @@ CMD="${CMD} \
     --exit-interval ${EXIT_INTERVAL} \
     --tensorboard-dir ${TENSORBOARD_DIR} \
     --log-validation-ppl-to-tensorboard \
-    --log-batch-size-to-tensorboard \
     --log-timers-to-tensorboard \
     --load ${LOAD_DIR} \
+    --use-checkpoint-args \
     --eval-interval ${EVAL_INTERVAL} \
     --eval-iters ${EVAL_ITERS} \
     --data-path ${DATA_PATH} \
@@ -363,6 +379,17 @@ CMD="${CMD} \
 
 if [[ "${SEQ_PARALLEL}" -eq 1 ]]; then
     CMD="${CMD} --sequence-parallel"
+fi
+
+
+# Enable device sync at every micro batch execution level only for LLaMa 3.1 8B scenario
+if [[ "${LLAMA_VER}" = "3.1" ]] && [[ "${LLAMA_MODEL_SIZE}" = "8" ]] && [[ ${DP} = 8 ]] && [[ $((NUM_NODES*DEVICES_PER_NODE)) = 8 ]]; then
+    TRAIN_MICRO_BATCH_SYNC_INTERVAL=${HL_MICRO_BATCH_SYNC_INTERVAL:-1}
+    CMD="${CMD} --micro-batch-sync-interval ${TRAIN_MICRO_BATCH_SYNC_INTERVAL}"
+fi
+
+if [[ "${LLAMA_VER}" = "2" ]] && [[ "${LLAMA_MODEL_SIZE}" = "7" ]] && [[ ${DP} = 8 ]] && [[ $((NUM_NODES*DEVICES_PER_NODE)) = 8 ]] && [[ "${FP8}" -eq 1 ]]; then
+    CMD="${CMD} --no-check-for-nan-in-loss-and-grad"
 fi
 
 if [[ "${USE_FUSED_SDPA}" = "1" || "${USE_FUSED_SDPA_WITH_RECOMPUTE}" = "1" ]]; then
@@ -409,6 +436,10 @@ if [[ "${TRANSFORMER_IMPL}" = "transformer_engine" && "${FP8}" -eq 1 ]]; then
     if [[ "${FP8_AMAX_REDUCE}" -eq 1 ]]; then
         CMD="${CMD} --fp8-amax-reduce"
     fi
+
+    CMD="${CMD} --cache-fp8-weight ${CACHE_FP8_WEIGHT}"
+    CMD="${CMD} --cache-fp8-weight-fwd ${CACHE_FP8_WEIGHT_FWD}"
+
 fi
 
 # handle kill switch file argument
@@ -426,17 +457,14 @@ fi
 if [[ "${CHECKPOINT_SAVE}" -eq 1 ]]; then
     CMD="${CMD} --save ${CHECKPOINTS_DIR}"
     CMD="${CMD} --save-interval ${SAVE_INTERVAL}"
-    CMD="${CMD} --dist-ckpt-format ${DIST_CKPT_FORMAT}"
-    if [[ "${USE_DIST_CKPT}" -eq 1 ]]; then
-        CMD="${CMD} --use-dist-ckpt"
-    fi
+    CMD="${CMD} --ckpt-format ${CKPT_FORMAT}"
     if [[ "${VERIFY_CKPT}" -eq 1 ]]; then
         CMD="${CMD} --verify-checkpoint"
         CMD="${CMD} --verify-checkpoint-model-type LLAMA"
     fi
 fi
 
-if [[ "${TOKENIZER_TYPE}" = "GPTSentencePieceTokenizer" || "${TOKENIZER_TYPE}" = "Llama3Tokenizer" ]]; then
+if [[ "${TOKENIZER_TYPE}" = "GPTSentencePieceTokenizer" || "${TOKENIZER_TYPE}" = "HuggingFaceTokenizer" ]]; then
     CMD="${CMD} --tokenizer-type ${TOKENIZER_TYPE}"
     CMD="${CMD} --tokenizer-model ${TOKENIZER_MODEL}"
 elif [[ "${TOKENIZER_TYPE}" = "GPT2BPETokenizer" ]]; then

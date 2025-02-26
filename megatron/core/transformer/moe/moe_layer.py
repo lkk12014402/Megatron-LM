@@ -1,3 +1,4 @@
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
@@ -7,7 +8,12 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import (
+    GroupedMLP,
+    IntelDynamicMLP,
+    SequentialMLP,
+    TEGroupedMLP,
+)
 from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import MoEAlltoAllSEQTokenDispatcher
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -78,6 +84,8 @@ class MoELayer(BaseMoELayer):
                 self.experts = TEGroupedMLP(self.num_local_experts, self.config, self.submodules)
             else:
                 self.experts = GroupedMLP(self.num_local_experts, self.config)
+        elif self.config.moe_dynamic_hpu:
+            self.experts = IntelDynamicMLP(self.num_local_experts, self.config)
         else:
             assert isinstance(self.submodules, MLPSubmodules)
             self.experts = SequentialMLP(self.num_local_experts, self.config, self.submodules)
@@ -120,9 +128,16 @@ class MoELayer(BaseMoELayer):
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
             return output, mlp_bias
 
-        if self.moe_layer_recompute:
+        def custom_forward_hpu(hidden_states):
+            probs, indices = self.router(hidden_states)
+            output, mlp_bias = self.experts(hidden_states, probs, indices)
+            return output, mlp_bias
+
+        fn = custom_forward_hpu if self.config.moe_dynamic_hpu else custom_forward
+
+        if self.moe_layer_recompute and not self.config.moe_dynamic_hpu:
             output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
         else:
-            output, mlp_bias = custom_forward(hidden_states)
+            output, mlp_bias = fn(hidden_states)
 
         return output, mlp_bias

@@ -1,4 +1,4 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
+# © 2024-2025 Intel Corporation
 # All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,22 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-import sys
 import os
+import sys
+
+import torch
+
 from .utils import is_real_cuda_device_available
 
 on_step_begin = []
 on_step_end = []
 
+
 def trigger(phase):
     [f() for f in phase]
 
-def setup_profiler(profile_type,
-                   profile_ranks,
-                   profile_step_start,
-                   profile_step_end,
-                   tensorboard_dir):
+
+def setup_profiler(
+    profile_type, profile_ranks, profile_step_start, profile_step_end, tensorboard_dir
+):
     if profile_type is None or not torch.distributed.get_rank() in profile_ranks:
         return
 
@@ -40,12 +42,14 @@ def setup_profiler(profile_type,
     def on_step_begin_fn():
         nonlocal cur_step
         cur_step = cur_step + 1
+
     on_step_begin.append(on_step_begin_fn)
 
     def when(cond, clbk):
         def fn():
             if cond():
                 clbk()
+
         return fn
 
     def is_start_step():
@@ -68,7 +72,8 @@ def setup_profiler(profile_type,
             schedule=schedule,
             activities=activities,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(tensorboard_dir, use_gzip=True),
-            with_stack=full)
+            with_stack=full,
+        )
 
         on_step_begin.append(when(is_start_step, profiler.start))
         on_step_end.append(when(is_capture_step, profiler.step))
@@ -77,6 +82,7 @@ def setup_profiler(profile_type,
     elif profile_type == 'hltv':
         sys.path.append(os.environ['PYTORCH_MODULES_ROOT_PATH'])
         from topologies.tools import SynapseProfilerApi, TraceType
+
         api = SynapseProfilerApi()
 
         def on_start_step():
@@ -85,8 +91,7 @@ def setup_profiler(profile_type,
 
         def on_end_step():
             nonlocal api
-            import habana_frameworks.torch.hpu as hpu
-            hpu.synchronize()
+            api.profiler_sync(0)
             api.profiler_stop(TraceType.TraceAll, 0)
             api.profiler_get_trace_json(TraceType.TraceAll, 0)
 

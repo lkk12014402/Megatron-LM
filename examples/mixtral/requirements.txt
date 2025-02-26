@@ -1,3 +1,6 @@
+matplotlib
 regex
+seaborn
 sentencepiece
+tabulate
 tensorboard

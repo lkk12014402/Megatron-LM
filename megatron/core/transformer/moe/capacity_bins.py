@@ -12,6 +12,11 @@ from megatron.core.parallel_state import (
 )
 
 
+def is_usage_data_available(usage_tensor):
+    with torch.no_grad():
+        return usage_tensor.sum().item() > 0
+
+
 class CapacityBins(torch.nn.Module):
     """CapacityBins - maps current capacity value into capacity bins.
 
@@ -36,6 +41,47 @@ class CapacityBins(torch.nn.Module):
     Argument use_cpu forces capacity bins logic to be executed on the CPU (not on the accelerator).
     When using torch.compile, this prevents potential graph breaks.
     """
+
+    class State:
+
+        def __init__(self, name, capacityBins) -> None:
+            self.name = name
+            self.capacityBins = capacityBins
+            capacityBins.register_buffer(
+                name + '_bins_usage_last', capacityBins.zero_bins.clone().detach()
+            )
+            capacityBins.register_buffer(
+                name + '_total_requested_capacity_last', capacityBins.zero_tensor.clone().detach()
+            )
+            self.bins_usage_last = getattr(capacityBins, name + '_bins_usage_last')
+            self.total_requested_capacity_last = getattr(
+                capacityBins, name + '_total_requested_capacity_last'
+            )
+
+        def zero(self):
+            self.bins_usage_last.zero_()
+            self.total_requested_capacity_last.zero_()
+
+        def save_device(self):
+            self.bins_usage_last = self.bins_usage_last.to(self.capacityBins.device)
+            self.total_requested_capacity_last = self.total_requested_capacity_last.to(
+                self.capacityBins.device
+            )
+
+        def update(self, bins_usage, total_requested_capacity):
+            delta_bins_usage = bins_usage
+            if is_usage_data_available(self.bins_usage_last):
+                delta_bins_usage -= self.bins_usage_last
+            self.bins_usage_last.copy_(bins_usage)
+            bins_usage = delta_bins_usage
+
+            delta_requested_capacity = total_requested_capacity
+            if is_usage_data_available(self.total_requested_capacity_last):
+                delta_requested_capacity -= self.total_requested_capacity_last
+            self.total_requested_capacity_last.copy_(total_requested_capacity)
+            total_requested_capacity = delta_requested_capacity
+
+            return total_requested_capacity, bins_usage
 
     def __init__(
         self,
@@ -69,11 +115,14 @@ class CapacityBins(torch.nn.Module):
         self.use_cpu = use_cpu
 
         # initialize usage stats
-        zero_bins = torch.zeros(
+        self.zero_bins = torch.zeros(
             num_capacity_bins, dtype=torch.long, device='cpu', requires_grad=False
         )
-        self.register_buffer('bins_usage', zero_bins.clone().detach())
-        self.register_buffer('bins_usage_last', zero_bins.clone().detach())
+        self.zero_tensor = torch.zeros(1, dtype=torch.long, device='cpu', requires_grad=False)
+        self.register_buffer('bins_usage', self.zero_bins.clone().detach())
+        self.register_buffer('total_requested_capacity', self.zero_tensor.clone().detach())
+
+        self.save_states = {'optimize_moe': CapacityBins.State('optimize_moe', self)}
 
         # initialize bin edges
         if configured_bins is not None:
@@ -85,7 +134,7 @@ class CapacityBins(torch.nn.Module):
             # we don't know the range of the capacity bins, therefore we create a zeroed tensor
             # when we load from checkpoint, or during the first forward, we update the bins
             # note that if the first element = 0, it marks that capacity_bins is not initialized
-            self.register_buffer('capacity_bins', zero_bins.clone().detach())
+            self.register_buffer('capacity_bins', self.zero_bins.clone().detach())
 
         # attribute self.device is the device to use for capacity bins logic, where attribute self.model_device
         # is the device used by the model. attributes can be different in case use_cpu is configured.
@@ -101,16 +150,17 @@ class CapacityBins(torch.nn.Module):
             # set the new capacity bins and clear the usage stats (not relevant for new bins)
             self.capacity_bins.copy_(torch.tensor(bins, dtype=torch.long, device=self.device))
             self.bins_usage.zero_()
-            self.bins_usage_last.zero_()
+            self.total_requested_capacity.zero_()
+            for save_state in self.save_states.values():
+                save_state.zero()
 
-    def get_stats(self, incremental=True):
-
-        def is_usage_data_available(usage_tensor):
-            with torch.no_grad():
-                return usage_tensor.sum().item() > 0
+    def get_stats(self, bins_state_name=None):
 
         if not is_usage_data_available(self.bins_usage):
             return None
+
+        if bins_state_name is not None and bins_state_name not in self.save_states.keys():
+            self.save_states[bins_state_name] = CapacityBins.State(bins_state_name, self)
 
         with torch.no_grad():
             # reduce stats across all workers; for that, we need to temporarily move stats to model device
@@ -122,19 +172,33 @@ class CapacityBins(torch.nn.Module):
 
             bins_usage = bins_usage.to(self.device)
 
-            # incremental returns only the diff from last activation of get_stats()
-            if incremental:
-                delta_bins_usage = bins_usage
-                if is_usage_data_available(self.bins_usage_last):
-                    delta_bins_usage -= self.bins_usage_last
-                self.bins_usage_last.copy_(bins_usage)
-                bins_usage = delta_bins_usage
+            total_requested_capacity = (
+                self.total_requested_capacity.clone().detach().to(self.model_device)
+            )
+            torch.distributed.all_reduce(
+                total_requested_capacity,
+                op=torch.distributed.ReduceOp.SUM,
+                group=get_data_parallel_group(),
+            )
+            total_requested_capacity = total_requested_capacity.to(self.device)
+
+            # incremental returns only the diff from last activation of
+            # get_stats() for the same state
+            if bins_state_name is not None:
+                total_requested_capacity, bins_usage = self.save_states[bins_state_name].update(
+                    bins_usage, total_requested_capacity
+                )
 
             # stats are returned using cpu tensors
             bins_usage = bins_usage.to('cpu')
             bins_usage_list = bins_usage.tolist()
             bins_edges = self.capacity_bins.clone().detach().to('cpu')
             bins_edges_list = bins_edges.tolist()
+            total_requested_capacity_scalar = total_requested_capacity.item()
+            total_used_capacity = sum(
+                usage * bin for usage, bin in zip(bins_usage_list, bins_edges_list)
+            )
+
             stats = {
                 'min_range': self.min_tokens_per_expert,
                 'max_range': self.max_tokens_per_expert,
@@ -142,6 +206,10 @@ class CapacityBins(torch.nn.Module):
                 'min_bin_size': self.min_bin_size,
                 'edges': bins_edges,
                 'usage': bins_usage,
+                'total_requested_capacity': total_requested_capacity_scalar,
+                'total_used_capacity': total_used_capacity,
+                'capacity_overhead_factor': total_used_capacity / total_requested_capacity_scalar
+                - 1,
                 'summary': {
                     f'bin{i}_{bins_edges_list[i]}': bins_usage_list[i]
                     for i in range(len(bins_usage))
@@ -161,7 +229,9 @@ class CapacityBins(torch.nn.Module):
             # move all model's buffers to device used for capacity bins logic
             self.capacity_bins = self.capacity_bins.to(self.device)
             self.bins_usage = self.bins_usage.to(self.device)
-            self.bins_usage_last = self.bins_usage_last.to(self.device)
+            self.total_requested_capacity = self.total_requested_capacity.to(self.device)
+            for save_state in self.save_states.values():
+                save_state.save_device()
 
     def get_binned_capacity(self, gate_output, capacity, update_stats=True):
         with torch.no_grad():
@@ -180,14 +250,15 @@ class CapacityBins(torch.nn.Module):
                 index, torch.tensor(len(bins) - 1, dtype=torch.int64, device=self.device)
             )
             if update_stats:
-                self._update_stats(index)
+                self._update_stats(index, capacity)
 
-        return bins[index].to(self.model_device)
+        return torch.index_select(bins, 0, index).to(self.model_device)
 
-    def _update_stats(self, index):
+    def _update_stats(self, index, requested_capacity):
         # currently we maintain stats for training only
         if self.training:
             self.bins_usage[index] += 1
+            self.total_requested_capacity += requested_capacity.to(torch.long)
 
     def _generate_bins(self, force_start_bin=False):
         # create exponentially growing width bins, and normalize width sum to 1.0

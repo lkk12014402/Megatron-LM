@@ -1,4 +1,6 @@
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 import pytest
 import torch
 
@@ -19,7 +21,9 @@ class TestCLIPViTModel:
             num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-        self.model = CLIPViTModel(transformer_config, transformer_layer_spec)
+        self.model = CLIPViTModel(
+            transformer_config, transformer_layer_spec, img_h=336, img_w=336, patch_dim=14
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -51,4 +55,4 @@ class TestCLIPViTModel:
         path = tmp_path / "model.pt"
         torch.save(self.model.state_dict(), path)
 
-        self.model.load_state_dict(torch.load(path))
+        self.model.load_state_dict(torch.load(path, weights_only=False))

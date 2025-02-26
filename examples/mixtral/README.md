@@ -1,13 +1,14 @@
 # Mixtral for PyTorch
 
 This directory provides examples of the GPT-based Mixtral models training in the Megatron-LM repository on Intel® Gaudi® 2 AI accelerator.
-Before you get started, make sure to review the [Supported Configuration](../../README.md#supported-configuration).
+Before you get started, make sure to review the [Supported Configurations](../../README.md#supported-configurations).
 
 ## Table of Contents
 * [Setup](#setup)
 * [Training Script Settings](#training-script-settings)
-* [Mixtral Training and Examples](#mixtral-training-and-examples)
-
+* [Useful Tools](#useful-tools)
+* [Supported Configuration](#supported-configuration)
+* [Known Issues](#known-issues)
 
 # Setup
 Please follow the instructions provided in the [Intel Gaudi Installation Guide](https://docs.habana.ai/en/latest/Installation_Guide/index.html)
@@ -103,7 +104,16 @@ Configure the following for the Mixtral examples below:
 
 Refer to [training script settings](#training-script-settings) for details.
 
-* Run Mixtral 8x7b on 32 HPUs, Lazy mode, with BF16 precision, sequence length 32k:
+### Activation Checkpointing
+`HL_CKP_ACT` has 4 modes:
+* 0 - no checkpointing
+* 1 - full-layer checkpointing `--recompute-granularity full --recompute-method uniform`
+* 2 - selective checkpoinitng `--recompute-granularity selective`
+* 3 - moe-layer recompute only `--moe-layer-recompute`
+This can be additonaly paired with Fused SDPA recompute `HL_USE_FUSED_SDPA_WITH_RECOMPUTE=1`.
+More information on these settings can be found in the main README section.
+
+### Run Mixtral 8x7b on 32 HPUs, Lazy mode, with BF16 precision, sequence length 32k:
   ```
   HL_HOSTSFILE=$MEGATRON_LM_ROOT/examples/hostsfile \
   HL_TOKEN_DISPATCHER_TYPE='alltoall' \
@@ -119,19 +129,41 @@ Refer to [training script settings](#training-script-settings) for details.
   $MEGATRON_LM_ROOT/examples/mixtral/pretrain_mixtral.sh
   ```
 
-### Validated Configurations
-The following configurations have been validated to be functioning with Gaudi 2:
-* DP+TP+SP
-* DP+TP+SP+allgather+ExTP
-* DP+EP
-* DP+EP+allgather+ExTP
+### Validated Configurations for MoE 
+For the best performance and model accuracy please use MoE with Capacity Bins as in the example specified above.
+Any other configuration using MoE Capacity Factor with or without padding should run with AllToAll Token Dispatcher.
 
-Pipeline parallelism (PP) was not validated, therefore it may not work correctly.
+The following configurations have been validated to be functioning with Gaudi 2. 
+* DP+TP+SP+AllToAll
+* DP+EP+AllToAll
+* Pipeline Parallel may be combined with the above configurations.
+
+# Useful Tools
+
+### Analysis of token distribution among experts
+Use `HL_MOE_TOKEN_DISTRIBUTION_LOGGING=1` to enable token distribution logging (by default disabled). To modify the log interval,
+use `HL_MOE_TOKEN_DISTRIBUTION_LOGGING_INTERVAL=your_desired_value` (the default is 50). Logger produces the following table to the console:
+```
+|   Expert 0 |   Expert 1 |   Expert 2 |   Expert 3 |   Expert 4 |   Expert 5 |   Expert 6 |   Expert 7 |
+|------------|------------|------------|------------|------------|------------|------------|------------|
+|         48 |         76 |       3120 |      13952 |        249 |      15104 |        191 |         15 |
+|        193 |        220 |      10112 |      13696 |        444 |       7360 |        664 |         43 |
+|         77 |        241 |      13440 |      14016 |        364 |       4000 |        660 |         20 |
+|        106 |       1312 |      10880 |      13760 |       2256 |       3888 |        560 |         18 |
+```
+Single row represents results accumulated from all micro-batches, so they should sum to approx.: `seq_len * topk * gbs`.
+If there are more than one layer, table for each of them will be provided. Token distribution is also present in a form of heatmap in tensorboard logs.
+
+### Megatron-LM/Hugging Face Transformers Checkpoint Converter
+
+The tools convert between distributed Megatron-LM and Hugging Face checkpoint formats, enabling easier loading and deployment with the Hugging Face Transformers library. Bidirectional conversion is supported (MLM -> HF as well as HF -> MLM).
+
+For more information, please see [tools/checkpoint/README.md](../../tools/checkpoint/README.md).
 
 # Supported Configuration
 | Validated on  | Intel Gaudi Software Version | PyTorch Version | Mode     |
 |---------------|------------------------------|-----------------|----------|
-| Gaudi 2       | 1.19.0                       | 2.5.1           | Training |
+| Gaudi 2       | 1.20.0                       | 2.6.0           | Training |
 
 # Known Issues
 * Only scripts and configurations mentioned in this README are supported and verified.

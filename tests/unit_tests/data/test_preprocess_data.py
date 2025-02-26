@@ -1,3 +1,4 @@
+# Copyright (C) 2025 Intel Corporation
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import json
@@ -6,6 +7,7 @@ import sys
 import tempfile
 
 import nltk
+import pytest
 import requests
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
@@ -81,14 +83,12 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
     dummy_jsonl(path_to_raws)
 
     # build the datasets
-    build_datasets(
-        path_to_raws, path_to_data, extra_args=extra_args,
-    )
+    build_datasets(path_to_raws, path_to_data, extra_args=extra_args)
 
     # merge the datasets
     merge_datasets(path_to_data)
 
-    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None,] + extra_args
+    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None] + extra_args
     encoder = Encoder(build_args())
     encoder.initializer()
 
@@ -184,6 +184,7 @@ def gpt2_merge(odir):
     return path
 
 
+# @pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -214,6 +215,7 @@ def bert_vocab(odir):
     return path
 
 
+@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
 

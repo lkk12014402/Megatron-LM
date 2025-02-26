@@ -1,8 +1,9 @@
-# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
 import math
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -11,7 +12,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.aux_loss import (
     AuxLossAutoScaler,
     aux_losses_tracker_save,
-    aux_losses_tracker_track_metrics
+    aux_losses_tracker_track_metrics,
 )
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -28,7 +29,8 @@ class DotProductAttention(MegatronModule):
     Region where selective activation recomputation is applied.
     This region is memory intensive but less compute intensive which
     makes activation checkpointing more efficient for LLMs (20B+).
-    See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
+    See Reducing Activation Recomputation in Large Transformer Models:
+    https://arxiv.org/abs/2205.05198 for more details.
 
     We use the following notation:
      h: hidden size
@@ -104,7 +106,7 @@ class DotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
-        packed_seq_params: PackedSeqParams = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
@@ -130,24 +132,19 @@ class DotProductAttention(MegatronModule):
             )
 
         # [b, np, sq, sk]
-        output_size = (
-            query.size(1),
-            query.size(2),
-            query.size(0),
-            key.size(0),
-        )
+        output_size = (query.size(1), query.size(2), query.size(0), key.size(0))
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
         # This will be a simple view when doing normal attention, but in group query attention
-        # the key and value tensors are repeated to match the queries so you can't use simple strides
-        # to extract the queries.
+        # the key and value tensors are repeated to match the queries so you can't use
+        # simple strides to extract the queries.
         query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu",
+            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
         )
 
         # Raw attention scores. [b * np, sq, sk]
@@ -190,12 +187,7 @@ class DotProductAttention(MegatronModule):
         # [sk, b, np, hn] --> [b, np, sq, hn]
 
         # context layer shape: [b, np, sq, hn]
-        output_size = (
-            value.size(1),
-            value.size(2),
-            query.size(0),
-            value.size(3),
-        )
+        output_size = (value.size(1), value.size(2), query.size(0), value.size(3))
 
         # change view [sk, b * np, hn]
         value = value.view(value.size(0), output_size[0] * output_size[1], -1)
@@ -238,7 +230,7 @@ class DotProductAttention(MegatronModule):
 
             # calculate z-loss
             z_loss_coeff = self.z_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
-            z_loss = torch.mean(z ** 2) * z_loss_coeff
+            z_loss = torch.mean(z**2) * z_loss_coeff
 
             # divide by dp here and then use "reduce_group" to reduce-sum over dp group
             dp = parallel_state.get_data_parallel_world_size()
@@ -255,7 +247,9 @@ class DotProductAttention(MegatronModule):
         return scores
 
 
-def save_to_attention_z_loss_tracker(name: str, loss: torch.Tensor, layer_number: int, num_layers: int):
+def save_to_attention_z_loss_tracker(
+    name: str, loss: torch.Tensor, layer_number: int, config: TransformerConfig
+):
     """Save the attention z-loss tracker for logging.
     Args:
         name (str): The name of the loss.
@@ -264,15 +258,29 @@ def save_to_attention_z_loss_tracker(name: str, loss: torch.Tensor, layer_number
         num_layers (int): The number of total layers.
     """
     tracker = parallel_state.get_attention_z_loss_tracker()
-    layer_offset = get_transformer_layer_offset(num_layers)
+    layer_offset = get_transformer_layer_offset(config)
     global_layer_number = layer_offset + layer_number
-    aux_losses_tracker_save(tracker, name, loss, global_layer_number, num_layers,
-                            reduce_group=parallel_state.get_data_parallel_group())
+    aux_losses_tracker_save(
+        tracker,
+        name,
+        loss,
+        global_layer_number,
+        config.num_layers,
+        reduce_group=parallel_state.get_data_parallel_group(),
+    )
 
 
 def track_attention_z_loss_metrics(
     loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False
 ):
     tracker = parallel_state.get_attention_z_loss_tracker()
-    aux_losses_tracker_track_metrics(tracker, loss_scale, iteration, writer, wandb_writer, total_loss_dict,
-                                     per_layer_logging, per_layer_prefix='attention_z_loss/')
+    aux_losses_tracker_track_metrics(
+        tracker,
+        loss_scale,
+        iteration,
+        writer,
+        wandb_writer,
+        total_loss_dict,
+        per_layer_logging,
+        per_layer_prefix='attention_z_loss/',
+    )

@@ -1,3 +1,4 @@
+# © 2024-2025 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import json
@@ -5,9 +6,13 @@ import os
 import sys
 import torch
 import transformers
+from transformers import MixtralConfig
 from tqdm import tqdm
 import types
 
+from megatron.core.utils import is_real_cuda_device_available
+
+device = "cpu"
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Mixtral HF loader.')
@@ -21,42 +26,104 @@ def add_arguments(parser):
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of deepspeed repository')
+    parser.add_argument('--bf16', action='store_true',
+                        help='Whether to load weights in bf16.')
+    parser.add_argument('--load-capacity-bins',  action='store_true',
+                        help='Load capacity bins parameters.')
 
 
-def load_args_from_checkpoint(args):
-    # Read Mixtral 8x7B args.
-    from transformers import MixtralConfig
-    mixtral_config = MixtralConfig.from_pretrained(args.load)
+def load_args_from_checkpoint(margs, args, use_source_margs_file=False):
+    # Read Mixtral 8x7B args from source margs file or use default values.
 
-    # Update Megatron args.
-    args.untie_embeddings_and_output_weights = True
-    args.seq_length = 4096
-    args.global_batch_size = 1024
-    args.iteration = 1 # '0', 'release' don't work
-    args.add_position_embedding = False
-    args.use_rotary_position_embeddings = True
-    args.swiglu = True
-    args.bf16 = True
-    args.add_bias_linear = False
-    args.normalization = "RMSNorm"
-    args.tokenizer_type = "Llama2Tokenizer"
-    args.disable_bias_linear = True
+    # During MLM -> HF conversion, many training, model arguments are not saved
+    # in the final checkpoint or in config.json, so we need to load them from
+    # the source checkpoint.
+    # `source_megatron_args.json` is created during MLM to HF conversion,
+    # essential to make the final MLM, MLM (1) -> HF -> MLM (2) checkpoint
+    # consistent.
 
-    args.max_position_embeddings = mixtral_config.max_position_embeddings
-    args.hidden_size = mixtral_config.hidden_size
-    args.num_attention_heads = mixtral_config.num_attention_heads
-    args.num_layers = mixtral_config.num_hidden_layers
-    args.norm_epsilon = mixtral_config.rms_norm_eps
-    args.vocab_size = mixtral_config.vocab_size
-    args.padded_vocab_size = mixtral_config.vocab_size
-    args.mixtral = mixtral_config
-    args.ffn_hidden_size = mixtral_config.intermediate_size
-    args.num_experts = mixtral_config.num_local_experts
-    args.sequence_parallel = True
+    mixtral_config = MixtralConfig.from_pretrained(margs.load)
 
-    if mixtral_config.num_key_value_heads:
-        args.group_query_attention = True
-        args.num_query_groups = mixtral_config.num_key_value_heads
+    if use_source_margs_file:
+        print(f"Loading arguments from {args.source_margs_file} ")
+        exclusions = {
+            "sequence_parallel",
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "expert_model_parallel_size",
+            "use_distributed_optimizer",
+            "verify_checkpoint",
+            "load",
+            "use_rotary_position_embeddings",
+            "transformer_pipeline_model_parallel_size",
+            "consumed_train_samples",
+            "consumed_valid_samples",
+            "tokenizer_model",
+            "encoder_num_layers",
+            "encoder_seq_length",
+            "start_weight_decay",
+            "end_weight_decay",
+
+        }
+        with open(args.source_margs_file, "r") as f:
+            src_megatron_args = json.load(f)
+
+        for key, val in src_megatron_args.items():
+            if key == 'pipeline_model_parallel_size' and hasattr(margs, key):
+                margs.previous_pipeline_model_parallel_size = val
+            if key == 'tensor_model_parallel_size' and hasattr(margs, key):
+                margs.previous_tensor_model_parallel_size = val
+
+            if key not in exclusions and hasattr(margs, key) and val != getattr(margs, key):
+                print(f"key: {key} replacing margs {getattr(margs, key)} with {val}.")
+                setattr(margs, key, val)
+    else:
+        print("Argument `--source-margs-file` is not set or path doesn't exit. Default megatron arguments would be set.")
+
+        # Update Megatron args.
+        margs.seq_length = 32768
+        margs.global_batch_size = 128
+        margs.tokenizer_type = "GPTSentencePieceTokenizer"
+        margs.disable_bias_linear = True
+        margs.untie_embeddings_and_output_weights = (not mixtral_config.tie_word_embeddings)
+        # Max position embeddings must be larger or equal sequence length
+        if mixtral_config.max_position_embeddings >= margs.seq_length:
+            margs.max_position_embeddings = mixtral_config.max_position_embeddings
+        else:
+            margs.max_position_embeddings = margs.seq_length
+        margs.hidden_size = mixtral_config.hidden_size
+        margs.num_attention_heads = mixtral_config.num_attention_heads
+        margs.num_layers = mixtral_config.num_hidden_layers
+        margs.use_rotary_position_embeddings = True
+        margs.swiglu = True
+        margs.normalization = "RMSNorm"
+
+        margs.norm_epsilon = mixtral_config.rms_norm_eps
+        margs.vocab_size = mixtral_config.vocab_size
+        margs.padded_vocab_size = mixtral_config.vocab_size
+        margs.ffn_hidden_size = mixtral_config.intermediate_size
+        margs.num_experts = mixtral_config.num_local_experts
+        margs.moe_extended_tp = False
+        margs.transformer_impl = 'transformer_engine'
+
+        margs.previous_tensor_model_parallel_size = 1
+        margs.previous_pipeline_model_parallel_size = 1
+
+        if mixtral_config.num_key_value_heads:
+            margs.group_query_attention = True
+            margs.num_query_groups = mixtral_config.num_key_value_heads
+
+
+    margs.iteration = 1 # '0', 'release' don't work
+    margs.padded_vocab_size = mixtral_config.vocab_size
+    margs.verify_checkpoint_model_type = 'MIXTRAL'
+
+    if '--use-cpu-initialization' in sys.argv:
+        margs.use_cpu_initialization = True
+    else:
+        margs.use_cpu_initialization = False
+
+    return margs
 
 def verify_transformers_version():
     major, minor, patch = map(int, transformers.__version__.split('.'))
@@ -98,6 +165,10 @@ def set_attn_state(args, layer, hf_layer):
 def set_mlp_state(args, layer, hf_layer):
     '''Set MLP params.'''
 
+    if args.moe_router_fp32:
+        layer.mlp.router.to(torch.float32)
+        hf_layer.block_sparse_moe.gate.weight.to(torch.float32)
+
     layer.mlp.router.weight.data.copy_(hf_layer.block_sparse_moe.gate.weight)
 
     mcore_experts = layer.mlp.experts.local_experts
@@ -122,21 +193,23 @@ def set_layer_state(args, model, hf_model, layer_idx):
     set_attn_state(args, layer, hf_layer)
     set_mlp_state(args, layer, hf_layer)
 
-    layer.self_attention.linear_qkv.layer_norm_weight.data.copy_(hf_layer.input_layernorm.weight)
+    if is_real_cuda_device_available():
+        layer.self_attention.linear_qkv.layer_norm_weight.data.copy_(hf_layer.input_layernorm.weight)
+    else:
+        layer.input_layernorm.weight.data.copy_(hf_layer.input_layernorm.weight)
     layer.pre_mlp_layernorm.weight.data.copy_(hf_layer.post_attention_layernorm.weight)
 
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
     from pretrain_gpt import model_provider
-    from transformers import MixtralForCausalLM, MixtralConfig
+    from transformers import MixtralForCausalLM
 
     # Load Huggingface model.
-
-    hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
+    hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map=device)
 
     # Init Megatron model.
-    model = model_provider(True, True).to(args.params_dtype)
+    model = model_provider(True, True).to(args.params_dtype).to(device)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -192,17 +265,31 @@ def _load_checkpoint(queue, args):
                 ]
 
     margs = parse_args()
-    margs.tokenizer_model = args.tokenizer_model
-    load_args_from_checkpoint(margs)
+
+    use_source_margs_file = args.source_margs_file is not None and os.path.exists(args.source_margs_file)
+
+    margs = load_args_from_checkpoint(margs, args, use_source_margs_file)
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
+    margs.tokenizer_model = args.tokenizer_model
     margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
+    margs.bf16 = args.bf16
+    margs.params_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
-    margs = validate_args(margs)
+    if margs.moe_capacity_bins_num > 0:
+        sys.argv.extend(['--moe-capacity-bins-num', str(margs.moe_capacity_bins_num)])
 
-    def check_for_arg(arg_name, default=None):
-        if getattr(margs, arg_name, None) is None:
+    capacity_bins_path = os.path.join(args.load_dir, 'capacity_bins.pt')
+    # Optionally load capacty bins
+    if args.load_capacity_bins:
+        assert os.path.exists(capacity_bins_path), 'The file for loading capacity bins parameters is missing.'
+        capacity_bins = torch.load(capacity_bins_path, weights_only=False)
+
+    validate_args(margs)
+
+    def check_for_arg(arg_name, dest_arg_name=None, default=None):
+        if getattr(margs, arg_name, None) is None and getattr(margs, dest_arg_name, None):
             if default is not None:
                 setattr(margs, arg_name, default)
             else:
@@ -213,6 +300,7 @@ def _load_checkpoint(queue, args):
 
     check_for_arg('tensor_model_parallel_size')
     check_for_arg('pipeline_model_parallel_size')
+    check_for_arg('expert_model_parallel_size')
     check_for_arg('num_layers')
     check_for_arg('hidden_size')
     check_for_arg('seq_length')
@@ -221,12 +309,12 @@ def _load_checkpoint(queue, args):
     check_for_arg('position_embedding_type')
     check_for_arg('tokenizer_type')
     check_for_arg('iteration')
-    check_for_arg('disable_bias_linear')
+    check_for_arg('disable_bias_linear', 'add_bias_linear')
     check_for_arg('params_dtype')
     check_for_arg('swiglu')
 
     # Determine how to make our models.
-    assert args.model_type == 'GPT', 'Llama-2 is a GPT model.'
+    assert args.model_type == 'GPT', 'Mixtral is a GPT model.'
     margs.model_type = ModelType.encoder_or_decoder
 
     # Suppress warning about torch.distributed not being initialized.
@@ -237,7 +325,8 @@ def _load_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
-    fused_kernels.load(margs)
+    if is_real_cuda_device_available():
+        fused_kernels.load(margs)
 
     # Metadata.
     md = types.SimpleNamespace()
@@ -256,14 +345,15 @@ def _load_checkpoint(queue, args):
     md.linear_bias = margs.add_bias_linear
     md.norm_has_bias = False
     md.swiglu = margs.swiglu
-    md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
-    md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
+    md.previous_tensor_parallel_size = margs.previous_tensor_model_parallel_size
+    md.previous_pipeline_parallel_size = margs.previous_pipeline_model_parallel_size
     md.true_vocab_size = margs.vocab_size # skips padding in saver
     md.make_vocab_size_divisible_by = None
     md.checkpoint_args = margs
     md.consumed_train_samples = 0
     md.consumed_valid_samples = 0
     md.num_experts = margs.num_experts
+    md.moe_capacity_bins_num = margs.moe_capacity_bins_num
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
@@ -294,7 +384,10 @@ def _load_checkpoint(queue, args):
 
         # Get non-parallel tensors from tp_rank 0.
         layer = model.decoder.layers[layer_idx]
-        message["input norm weight"] = layer.self_attention.linear_qkv.layer_norm_weight.data
+        if is_real_cuda_device_available():
+            message["input norm weight"] = layer.self_attention.linear_qkv.layer_norm_weight.data
+        else:
+            message["input norm weight"] = layer.input_layernorm.weight.data
         message["post norm weight"] = layer.pre_mlp_layernorm.weight.data
 
         # Simple concat of the rest.
@@ -306,7 +399,15 @@ def _load_checkpoint(queue, args):
         experts = layer.mlp.experts.local_experts
 
         message["router weight"] = layer.mlp.router.weight.data
-        if md.swiglu:
+
+        if args.load_capacity_bins:
+            message["bins usage"] = capacity_bins["bins_usage"][layer_idx]
+            message["total requested capacity"] = capacity_bins["total_requested_capacity"][layer_idx]
+            message["bins usage last"] = capacity_bins["optimize_moe_bins_usage_last"][layer_idx]
+            message["total requested capacity last"] = capacity_bins["optimize_moe_total_requested_capacity_last"][layer_idx]
+            message["capacity bins"] = capacity_bins['capacity_bins'][layer_idx]
+        
+        if is_real_cuda_device_available() and md.swiglu:
             chunked_mlp_l0_weight =  [torch.chunk(local_expert.linear_fc1.weight.data, 2, dim=0) for local_expert in experts]
             message["mlp l0 weight W"] = torch.stack([local_weight[0] for local_weight in chunked_mlp_l0_weight], dim=0)
             message["mlp l0 weight V"] = torch.stack([local_weight[1] for local_weight in chunked_mlp_l0_weight], dim=0)
@@ -330,6 +431,6 @@ def _load_checkpoint(queue, args):
 def load_checkpoint(queue, args):
     try:
         _load_checkpoint(queue, args)
-    except:
+    except Exception:
         queue.put("exit")
         raise

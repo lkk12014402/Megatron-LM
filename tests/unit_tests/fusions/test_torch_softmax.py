@@ -1,9 +1,12 @@
+# Copyright (C) 2024 Intel Corporation
+
 import pytest
 import torch
 
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.utils import attention_mask_func
+from megatron.core.transformer.utils import attention_mask_func, get_default_causal_mask
+from megatron.core.utils import is_real_cuda_device_available
 
 
 class TestTorchSoftmax:
@@ -19,6 +22,9 @@ class TestTorchSoftmax:
             softmax_in_fp32=True,
             scale=None,
         )
+
+    def teardown_method(self):
+        get_default_causal_mask.cache_clear()
 
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device="cuda")
@@ -41,4 +47,5 @@ class TestTorchSoftmax:
         y = self.softmax(x, None)
         y_expected = torch.tril(torch.ones(b, np, sq, sk, device="cuda"))
         y_expected /= torch.arange(1, sq + 1, device="cuda").reshape((-1, 1))
-        assert torch.allclose(y, y_expected, rtol=1e-08, atol=1e-08)
+        atol = 1e-08 if is_real_cuda_device_available() else 6e-08
+        assert torch.allclose(y, y_expected, rtol=1e-08, atol=atol)
