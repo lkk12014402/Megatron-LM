@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
 # This source code is licensed under the MIT license found in the
@@ -198,11 +198,14 @@ class _IndexWriter(object):
         document_indices = numpy.array(document_indices, dtype=numpy.int64)
         self.idx_writer.write(document_indices.tobytes(order="C"))
 
+        print("here Segmentation fault ??????????")
+        print(sequence_modes)
         # the mode per sequence
         if sequence_modes is not None:
             sequence_modes = numpy.array(sequence_modes, dtype=numpy.int8)
             self.idx_writer.write(sequence_modes.tobytes(order='C'))
             del sequence_modes
+        print("=="*10)
 
     def _sequence_pointers(self, sequence_lengths: List[int]) -> List[int]:
         """Build the sequence pointers per the sequence lengths and dtype size
@@ -305,13 +308,10 @@ class _IndexReader(object):
         # TODO: [SW-193211]
         # assert self.sequence_lengths.shape[0] == self.document_indices[-1]
         if self.sequence_lengths.shape[0] != self.document_indices[-1]:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "> sequence_lengths and document_indices doesn't "
-                f"match: {self.sequence_lengths.shape[0]} != "
-                f"{self.document_indices[-1]}",
-            )
+            log_single_rank(logger, logging.WARNING,
+                            "> sequence_lengths and document_indices doesn't "
+                            f"match: {self.sequence_lengths.shape[0]} != "
+                            f"{self.document_indices[-1]}")
 
         log_single_rank(logger, logging.INFO, f"> total number of sequences: {len(self)}")
         log_single_rank(
@@ -395,7 +395,12 @@ class _MMapBinReader(_BinReader):
         Returns:
             numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
         """
-        return numpy.frombuffer(self._bin_buffer, dtype=dtype, count=count, offset=offset)
+        return numpy.frombuffer(
+            self._bin_buffer,
+            dtype=dtype,
+            count=count,
+            offset=offset,
+        )
 
     def __del__(self) -> None:
         """Clean up the object."""
@@ -638,7 +643,9 @@ class IndexedDataset(torch.utils.data.Dataset):
         if isinstance(idx, (int, numpy.integer)):
             sequence_pointer, sequence_length, sequence_mode = self.index[idx]
             sequence = self.bin_reader.read(
-                dtype=self.index.dtype, count=sequence_length, offset=sequence_pointer
+                dtype=self.index.dtype,
+                count=sequence_length,
+                offset=sequence_pointer,
             )
             return (sequence, sequence_mode) if sequence_mode is not None else sequence
         elif isinstance(idx, slice):
@@ -839,8 +846,14 @@ class IndexedDatasetBuilder(object):
             idx_path (str): The path to the index file
         """
         self.data_file.close()
+        print(idx_path)
+        print(self.dtype)
+        print(self.sequence_lengths)
+        print(self.sequence_modes)
+        print(self.document_indices)
         with _IndexWriter(idx_path, self.dtype) as writer:
             writer.write(self.sequence_lengths, self.sequence_modes, self.document_indices)
+        print("finalize.....................................................................")
 
 
 def get_idx_path(path_prefix: str) -> str:

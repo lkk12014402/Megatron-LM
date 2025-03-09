@@ -1,7 +1,6 @@
-# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
-"""Pretrain GPT."""
 
+"""Finetune LLAMA, Modified from pretrain_gpt.py"""
 
 try:
     import habana_frameworks.torch
@@ -10,39 +9,65 @@ except:
 
 
 import os
-import torch
 from functools import partial
-
 from typing import Union
-from megatron.training import get_args
-from megatron.training import print_rank_0
-from megatron.training import get_timers
-from megatron.training import get_tokenizer
+
+import torch
+import torch._dynamo
 from megatron.core import mpu
-from megatron.core.enums import ModelType
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.blended_megatron_dataset_builder import (
+    BlendedMegatronDatasetBuilder,
+)
+from megatron.core.datasets.gpt_dataset import (
+    GPTDataset,
+    GPTDatasetConfig,
+    MockGPTDataset,
+)
+
 from megatron.core.datasets.utils import get_blend_from_list
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
-from megatron.core.utils import is_real_cuda_device_available
-import megatron.legacy.model
-from megatron.core.models.gpt import GPTModel
-from megatron.training import pretrain
-from megatron.core.utils import StragglerDetector
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.enums import ModelType
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.utils import (
+    average_losses_across_data_parallel_group,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
 )
-from megatron.training.arguments import core_transformer_config_from_args
+
+
+# from megatron_patch.arguments import get_patch_args
+# from megatron_patch.data import build_pretrain_dataset_from_original
+
+
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron_patch.data.utils import (
+    get_batch_on_this_tp_rank_original,
+    get_batch_on_this_tp_rank_idxmap_sft
+)
+
+
+# from megatron_patch.model.llama3_1.model import GPTModel
+from megatron.core.models.gpt import GPTModel
+#from megatron_patch.model.llama3_1.transformer_config import LLama3TransformerConfig
+#from megatron_patch.tokenizer import build_tokenizer, get_tokenizer
+from megatron.training import get_tokenizer
+
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.utils import StragglerDetector
+from megatron.core.transformer.spec_utils import import_module
+import megatron.legacy.model
+from megatron.core.utils import is_real_cuda_device_available
+
 
 
 stimer = StragglerDetector()
+
+
+# torch._dynamo.config.suppress_errors = True
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
@@ -126,13 +151,14 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator)
+
+    batch = get_batch_on_this_tp_rank_idxmap_sft(data_iterator)
+    print(batch)
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
     return batch.values()
-
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
@@ -176,7 +202,6 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
 
-
 def forward_step(data_iterator, model: GPTModel):
     """Forward training step.
 
@@ -191,19 +216,20 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+        tokens, labels, loss_mask, attention_mask, position_ids, _ = get_batch(
             data_iterator)
 
     """
     print("=*="*20)
-    print("tokens: ", tokens)
-    print("labels: ", labels)
-    print("loss_mask: ", loss_mask)
-    print("attention_mask: ", attention_mask)
-    print("position_ids: ", position_ids)
+    print(tokens)
+    print(labels)
+    print(loss_mask)
+    print(attention_mask)
+    print(position_ids)
     print("=*="*20)
-    exit()
+    # exit()
     """
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -255,6 +281,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     config = core_gpt_dataset_config_from_args(args)
 
+    # *2 for sft
+    config.sequence_length = config.sequence_length * 2
+
     if args.mock_data:
         dataset_type = MockGPTDataset
     else:
@@ -286,3 +315,5 @@ if __name__ == "__main__":
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
+
+

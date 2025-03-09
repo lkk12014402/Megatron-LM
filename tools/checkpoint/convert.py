@@ -1,11 +1,15 @@
-# © 2024-2025 Intel Corporation
+# Copyright (C) 2024 Intel Corporation
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+try:
+    import habana_frameworks.torch
+except:
+    pass
+
 
 import argparse
 import importlib
 import torch.multiprocessing as mp
 import sys
-import os
 
 # A loader is a python file with at least two functions
 # - add_arguments - takes in a parser and adds any arguments needed
@@ -109,6 +113,7 @@ def load_plugin(plugin_type, name):
     return plugin
 
 def main():
+    import argparse
     parser = argparse.ArgumentParser(description="Megatron Checkpoint Converter Arguments",
                                      allow_abbrev=False, conflict_handler='resolve')
 
@@ -151,12 +156,6 @@ def main():
 
     print("Waiting for saver to complete...")
     saver_proc.join()
-
-    # transformers AutoModel loads the model onto memory and keeps the thread open indefinitely.
-    # del hf_model and gc.collect() is not effective/delayed.
-    # Once the loader (main_thread) and saver (sub_thread) execution is complete, we can/must exit the process.
-    # If not done, the process will hang indefinitely even after all the operations are completed.
-    os._exit(0)
 
 
 if __name__ == '__main__':

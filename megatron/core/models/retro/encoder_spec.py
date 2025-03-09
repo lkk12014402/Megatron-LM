@@ -1,4 +1,4 @@
-# © 2024-2025 Intel Corporation
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 """Specs for Retro encoder."""
@@ -22,8 +22,9 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
+"""
 try:
-    from megatron.core.extensions.transformer_engine import (
+    from megatron.core.transformer.custom_layers.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
         TENorm,
@@ -33,9 +34,11 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+"""
+HAVE_TE = False
 
 try:
-    import apex  # pylint: disable=unused-import
+    import apex
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -50,7 +53,7 @@ except ImportError:
     LNImpl = WrappedTorchLayerNorm
 
 try:
-    from megatron.core.extensions.intel_transformer_engine import (
+    from megatron.core.transformer.custom_layers.intel_transformer_engine import (
         IntelTEColumnParallelLinear,
         IntelTEDotProductAttention,
         IntelTENorm,
@@ -82,8 +85,10 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
         normalization_class = TENorm
     else:
         enable_fsdpa = False
-        from intel_transformer_engine.utils import is_gaudi3
-
+        try:
+            from intel_transformer_engine.utils import is_gaudi3
+        except:
+            from habana_transformer_engine.utils import is_gaudi3
         if is_gaudi3() and enable_fsdpa:
             core_attention_class = IntelTEDotProductAttention
         elif enable_fsdpa:
@@ -99,7 +104,9 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     spec.submodules.pre_cross_attn_layernorm = normalization_class
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroEncoderCrossAttention,
-        params={"attn_mask_type": AttnMaskType.padding},
+        params={
+            "attn_mask_type": AttnMaskType.padding,
+        },
         submodules=CrossAttentionSubmodules(
             linear_q=linear_q,
             linear_kv=linear_kv,
@@ -109,10 +116,15 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
     spec.submodules.pre_mlp_layernorm = ModuleSpec(
-        module=RetroEncoderLayerNorm, submodules=normalization_class
+        module=RetroEncoderLayerNorm,
+        submodules=normalization_class,
     )
     spec.submodules.mlp = ModuleSpec(
-        module=MLP, submodules=MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+        module=MLP,
+        submodules=MLPSubmodules(
+            linear_fc1=linear_fc1,
+            linear_fc2=linear_fc2,
+        ),
     )
     return spec
 
@@ -132,7 +144,9 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
     spec.submodules.pre_cross_attn_layernorm = LNImpl
     spec.submodules.cross_attention = ModuleSpec(
         module=RetroEncoderCrossAttention,
-        params={"attn_mask_type": AttnMaskType.padding},
+        params={
+            "attn_mask_type": AttnMaskType.padding,
+        },
         submodules=CrossAttentionSubmodules(
             linear_q=ColumnParallelLinear,
             linear_kv=ColumnParallelLinear,
@@ -141,13 +155,19 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
-    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm, submodules=LNImpl)
+    spec.submodules.pre_mlp_layernorm = ModuleSpec(
+        module=RetroEncoderLayerNorm,
+        submodules=LNImpl,
+    )
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
+        submodules=MLPSubmodules(
+            linear_fc1=ColumnParallelLinear,
+            linear_fc2=RowParallelLinear,
+        ),
     )
     spec.submodules.sharded_state_dict_keys_map = {
-        'input_layernorm.': 'self_attention.linear_qkv.layer_norm_'
+        'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
     }  # pre_mlp_layernorm doesn't need remapping
     return spec
 
@@ -189,8 +209,10 @@ def get_retro_encoder_block_spec(
             module = TEDotProductAttention
         else:
             enable_fsdpa = False
-            from intel_transformer_engine.utils import is_gaudi3
-
+            try:
+                from intel_transformer_engine.utils import is_gaudi3
+            except:
+                from habana_transformer_engine.utils import is_gaudi3
             if is_gaudi3() and enable_fsdpa:
                 module = IntelTEDotProductAttention
             elif enable_fsdpa:
@@ -203,7 +225,10 @@ def get_retro_encoder_block_spec(
         spec.params["hidden_dropout"] = config.retro_encoder_hidden_dropout
         spec.submodules.self_attention.params["attn_mask_type"] = AttnMaskType.padding
         spec.submodules.self_attention.submodules.core_attention = ModuleSpec(
-            module=module, params={"attention_dropout": config.retro_encoder_attention_dropout}
+            module=module,
+            params={
+                "attention_dropout": config.retro_encoder_attention_dropout,
+            },
         )
 
     layer_specs = []

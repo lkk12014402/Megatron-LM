@@ -207,7 +207,7 @@ elif [[ "${LLAMA_VER}" = "3.2" ]]; then
     MAX_SEQ_LEN=${HL_SEQ_LEN:-4096}
     TRAIN_ITERS=${HL_TRAIN_ITERS:-937500}
     ADAM_EPS=1e-5
-    LR_WARMUP_ITERS=8000
+    LR_WARMUP_ITERS=0
     ROTARY_BASE=500000
     if [[ "${LLAMA_MODEL_SIZE}" = "1" ]]; then
         # LLaMA3.1-8B model architecture
@@ -230,7 +230,7 @@ if [[ $(( NUM_LAYERS % PP )) -ne 0 ]]; then
 fi
 
 # Paths
-SRC_PATH="${MEGATRON_LM_ROOT}/pretrain_gpt.py"
+SRC_PATH="${MEGATRON_LM_ROOT}/finetune_llama.py"
 DATA_PATH=${DATA_DIR}/${DATA_FILE_PREFIX}
 
 if [[ -z "${TOKENIZER_MODEL}" ]]; then

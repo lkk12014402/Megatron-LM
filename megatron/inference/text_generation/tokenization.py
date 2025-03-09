@@ -12,13 +12,14 @@ from .communication import broadcast_int_list, broadcast_tensor
 
 def detokenize_generations(tokens_gpu_tensor,
                            lengths_gpu_tensor,
-                           detokenize_segments):
+                           return_segments):
     """Detokenize the generated tokens."""
 
     args = get_args()
     tokenizer = get_tokenizer()
     prompts_plus_generations = []
-    prompts_plus_generations_segments = []
+    if return_segments:
+        prompts_plus_generations_segments = []
 
     tokens = tokens_gpu_tensor.cpu().numpy().tolist()
     lengths = lengths_gpu_tensor.cpu().numpy().tolist()
@@ -26,7 +27,7 @@ def detokenize_generations(tokens_gpu_tensor,
         sequence_tokens = sequence_tokens[:length]
         prompts_plus_generations.append(
             tokenizer.detokenize(sequence_tokens))
-        if detokenize_segments:
+        if return_segments:
             words = []
             for token in sequence_tokens:
                 if args.tokenizer_type in ['SentencePieceTokenizer',
@@ -34,8 +35,6 @@ def detokenize_generations(tokens_gpu_tensor,
                                            'HuggingFaceTokenizer',
                                            'Llama2Tokenizer']:
                     word = tokenizer.decoder[token]
-                elif args.tokenizer_type == 'TikTokenizer':
-                    word = tokenizer.detokenize([token])
                 elif args.tokenizer_type in ['Llama3Tokenizer', 'MistralTokenizer']:
                     word = tokenizer.decode([token])
                 elif args.tokenizer_type == 'NullTokenizer':
@@ -48,7 +47,11 @@ def detokenize_generations(tokens_gpu_tensor,
                 words.append(word)
             prompts_plus_generations_segments.append(words)
 
-    return tokens, prompts_plus_generations, prompts_plus_generations_segments
+    if return_segments:
+        return tokens, prompts_plus_generations, \
+            prompts_plus_generations_segments
+
+    return tokens, prompts_plus_generations
 
 
 def tokenize_prompts(prompts=None, tokens_to_generate=None,
@@ -98,6 +101,7 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
     # Tokenize all the prompts.
     args = get_args()
     tokenizer = get_tokenizer()
+    print(tokenizer)
     if hasattr(tokenizer, 'eod'):
         eod_token = tokenizer.eod
     elif hasattr(tokenizer, 'eos_id'):

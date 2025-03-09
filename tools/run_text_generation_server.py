@@ -2,6 +2,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate GPT"""
+
+try:
+    import habana_frameworks.torch
+except:
+    pass
+import habana_frameworks.torch.gpu_migration
+
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
@@ -24,7 +31,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 
-from contextlib import nullcontext
 import torch
 from typing import Union
 import megatron
@@ -68,7 +74,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             transformer_layer_spec = import_module(args.spec)
         else:
             if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
             else:
                 use_pre_norm = not args.apply_norm_post_sub_block
                 transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm,
@@ -86,8 +92,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             parallel_output=False,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base
+            rotary_percent=args.rotary_percent
         )
 
     return model
@@ -112,14 +117,8 @@ if __name__ == "__main__":
     print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text "
                  "generation.")
     args.exit_on_missing_checkpoint = True
-
     # Set up model and load checkpoint
-    load_context = nullcontext()
-    if args.fp8:
-        from transformer_engine.pytorch.fp8 import fp8_model_init
-        load_context = fp8_model_init()
-    with load_context:
-        model = get_model(model_provider, wrap_with_ddp=False)
+    model = get_model(model_provider, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

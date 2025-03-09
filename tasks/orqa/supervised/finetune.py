@@ -2,6 +2,13 @@
 
 """ORQA finetuning/evaluation."""
 
+
+try:
+    import habana_frameworks.torch
+except:
+    pass
+
+import os
 from functools import partial
 import sys
 
@@ -10,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.training import get_args, get_timers, get_tokenizer, print_rank_0
+
 from megatron.core import mpu
 from megatron.legacy.indexer import IndexBuilder
 from megatron.legacy.model.biencoder_model import biencoder_model_provider
@@ -53,7 +61,7 @@ def orqa(Dataset):
         timers('batch generator', log_level=2).start()
         try:
             batch_ = next(batch)
-        except Exception:
+        except BaseException:
             batch_ = batch
 
         group, rank, world_size = get_group_world_size_rank()
