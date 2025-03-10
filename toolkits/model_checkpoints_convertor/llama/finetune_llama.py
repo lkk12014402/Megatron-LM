@@ -153,27 +153,12 @@ def get_batch(data_iterator):
     # get batches based on the TP rank you are on
 
     batch = get_batch_on_this_tp_rank_idxmap_sft(data_iterator)
-    """
-    print(batch)
-    print("tokens: ", batch["tokens"].cpu().tolist())
-    print("labels: ", batch["labels"].cpu().tolist())
-    exit()
-    """
-    """
-    print_rank_0(batch)
-    print_rank_0(f"tokens: {batch['tokens'].shape}")
-    print_rank_0(f"tokens: {batch['tokens'].cpu().tolist()}")
-    print_rank_0(f"labels: , {batch['labels'].shape}")
-    print_rank_0(f"labels: , {batch['labels'].cpu().tolist()}")
-    print_rank_0(f"loss_mask: , {batch['loss_mask'].cpu().tolist()}")
-    """
+    # print(batch)
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
     return batch.values()
-
-'''
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
@@ -191,12 +176,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     args = get_args()
 
     losses = output_tensor.float()
-    print_rank_0(f"loss: , {losses}")
-
     loss_mask = loss_mask.view(-1).float()
     total_tokens = loss_mask.sum()
     loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
-    print_rank_0(f"loss: , {loss}")
 
     if args.context_parallel_size > 1:
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
@@ -213,55 +195,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
-    print_rank_0(f"loss: , {reporting_loss}")
-    exit()
-
     local_num_tokens = loss[1].clone().detach().to(torch.int)
     return (
         loss[0] * args.context_parallel_size,
         local_num_tokens,
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
-
-'''
-
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
-    """Loss function.
-
-    Args:
-        loss_mask (torch.Tensor): Used to mask out some portions of the loss
-        output_tensor (torch.Tensor): The tensor with the losses
-    """
-    args = get_args()
-
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
-
-    loss = torch.stack([torch.sum(losses.view(-1) * loss_mask), loss_mask.sum()])
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss.isnan().any(), (
-            f"Rank {global_rank}: found NaN in local forward loss calculation. "
-            f"Device: {torch.cuda.current_device()}, node: {os.uname()[1]}"
-        )
-
-    averaged_loss = average_losses_across_data_parallel_group(loss)
-    averaged_loss = averaged_loss[0] / averaged_loss[1]
-
-    # NOTE: The grad will be scaled down by CP size later, should not remove this multilication factor
-    # LINK: https://github.com/NVIDIA/Megatron-LM/issues/906
-    # The issue is solved since 0926
-
-    local_num_tokens = loss_mask.sum().clone().detach().to(torch.int)
-
-    # print_rank_0(f"local_num_tokens: , {local_num_tokens}")
-    # print_rank_0(f"averaged_loss: , {averaged_loss}")
-
-    return loss[0] * args.context_parallel_size, local_num_tokens, {"lm loss": averaged_loss}
 
 def forward_step(data_iterator, model: GPTModel):
     """Forward training step.

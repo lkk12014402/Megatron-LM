@@ -168,7 +168,7 @@ elif [[ "${LLAMA_VER}" = "3.1" ]]; then
     MAX_SEQ_LEN=${HL_SEQ_LEN:-8192}
     TRAIN_ITERS=${HL_TRAIN_ITERS:-937500}
     ADAM_EPS=1e-5
-    LR_WARMUP_ITERS=8000
+    LR_WARMUP_ITERS=200
     ROTARY_BASE=500000
     if [[ "${LLAMA_MODEL_SIZE}" = "8" ]]; then
         # LLaMA3.1-8B model architecture
@@ -177,8 +177,8 @@ elif [[ "${LLAMA_VER}" = "3.1" ]]; then
         NUM_QUERY_GROUPS=${HL_NUM_QUERY_GROUPS:-8} # must be divisible by TP
         NUM_LAYERS=${HL_NUM_LAYERS:-32} # must be divisible by PP
         FFN_HIDDEN_SIZE=${HL_FFN_HIDDEN_SIZE:-14336}
-        LR=3e-4
-        MIN_LR=3e-6
+        LR=1e-5
+        MIN_LR=1e-8
     elif [[ "${LLAMA_MODEL_SIZE}" = "70" ]]; then
         # LLaMA3.1-70B model architecture
         HIDDEN_SIZE=${HL_HIDDEN_SIZE:-8192}
@@ -257,6 +257,7 @@ if [[ -z "${CHECKPOINTS_DIR}" ]]; then
 fi
 if [[ -z "${LOAD_DIR}" ]]; then
     LOAD_DIR=${CHECKPOINTS_DIR}
+    #LOAD_DIR=${LOAD_DIR}
 fi
 
 if [[ -z "${TENSORBOARD_DIR}" ]]; then
@@ -334,6 +335,7 @@ CMD="${CMD} \
     --group-query-attention \
     --num-query-groups ${NUM_QUERY_GROUPS} \
     --ffn-hidden-size ${FFN_HIDDEN_SIZE} \
+    --no-position-embedding \
     --position-embedding-type rope \
     --rotary-base ${ROTARY_BASE} \
     --max-position-embeddings ${MAX_SEQ_LEN} \
@@ -373,6 +375,8 @@ CMD="${CMD} \
     --log-batch-size-to-tensorboard \
     --log-timers-to-tensorboard \
     --load ${LOAD_DIR} \
+    --no-load-optim \
+    --no-load-rng \
     --eval-interval ${EVAL_INTERVAL} \
     --eval-iters ${EVAL_ITERS} \
     --data-path ${DATA_PATH} \

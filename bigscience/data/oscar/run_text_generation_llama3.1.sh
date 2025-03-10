@@ -5,7 +5,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_APPLY_QK_LAYER_SCALING=0
 
 DISTRIBUTED_ARGS="--nproc_per_node 1 \
-                  --nnodes 1 \
+                  --nnodes 4 \
                   --node_rank 0 \
                   --master_addr 0.0.0.0 \
                   --master_port 6000"
@@ -42,7 +42,7 @@ torchrun $DISTRIBUTED_ARGS $MEGATRON_LM_ROOT/tools/run_text_generation_server.py
       --rotary-base 500000 \
       --use-rotary-position-embeddings \
       --swiglu \
-      --tensor-model-parallel-size 1  \
+      --tensor-model-parallel-size 4  \
       --pipeline-model-parallel-size 1  \
       --num-layers 32  \
       --hidden-size 4096  \
